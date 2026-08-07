@@ -306,6 +306,11 @@ check("credential-shaped keys never appear in diagnostics",
       ) == {"ok": 1})
 
 check("percent strings parse as numbers", material.as_number("97.2%") == 97.2)
+check("a 0-1 fraction normalizes to a percentage", material.as_rate(0.9425) == 94.25)
+check("1.0 becomes 100 percent", material.as_rate(1.0) == 100.0)
+check("a 0-100 value is left alone", material.as_rate(94.25) == 94.25)
+check("zero is a valid rate, not missing", material.as_rate(0) == 0.0)
+check("junk is not a rate", material.as_rate("n/a") is None)
 check("plain numbers parse", material.as_number(41) == 41.0)
 check("booleans are not numbers", material.as_number(True) is None)
 check("junk is not a number", material.as_number("n/a") is None)
@@ -327,9 +332,11 @@ check("fleet size is reported", facts["agents in the fleet"] == 2)
 check("agent names are reported", "dns-drift" in facts["agent names"])
 check("run totals are summed", facts["total runs recorded across the fleet"] == 712)
 check("failures are summed", facts["failures recorded"] == 19)
-check("success rates are averaged", facts["average success rate"] == "97.0%")
+check("success rates are averaged", facts["average success rate"] == "97.00%")
 check("the weakest agent is named, not hidden",
       "cert-sentinel" in facts["lowest success rate"])
+check("an explicit failure count wins over the derived one",
+      facts["failures recorded"] == 19 and "failed runs (derived from rate)" not in facts)
 check("scores are averaged", facts["average score"] == 85.0)
 check("the most recent verification wins",
       facts["most recent verification"] == "2026-08-07")
@@ -348,6 +355,58 @@ check("an unreadable agent is stated plainly, not hidden",
 check("an unreadable agent does not block the post",
       partial["total runs recorded across the fleet"] == 412)
 
+# --- leaderboard shape (what the API actually returns) ---------------------- #
+
+LEADERBOARD = [
+    {"rank": 1, "slug": "alert-dedupe", "verification_level": "instrumented",
+     "score": 43.94, "rating_count": 0, "tasks_handled": 317,
+     "success_rate": 0.9968454258675079},
+    {"rank": 2, "slug": "dns-drift", "verification_level": "instrumented",
+     "score": 43.92, "rating_count": 0, "tasks_handled": 308, "success_rate": 1.0},
+    {"rank": 9, "slug": "cert-sentinel", "verification_level": "instrumented",
+     "score": 42.4, "rating_count": 0, "tasks_handled": 296,
+     "success_rate": 0.9425675675675675},
+    {"rank": 15, "slug": "movie-app", "verification_level": "self_reported",
+     "score": 0.0, "rating_count": 0, "tasks_handled": 0, "success_rate": None},
+]
+
+
+def from_entry(entry):
+    record = AgentRecord(entry["slug"], ok=True)
+    for name, candidates in material.FIELD_CANDIDATES.items():
+        value = material.find_field(entry, candidates)
+        if value is not None:
+            record.fields[name] = value
+    return record
+
+
+live_fleet = [from_entry(LEADERBOARD[1]), from_entry(LEADERBOARD[2])]
+context = material.platform_context(LEADERBOARD, "2026-08-07T17:54:06Z")
+real = material.build_facts(live_fleet, context)
+
+check("tasks_handled maps to the run count",
+      real["total runs recorded across the fleet"] == 604)
+check("a 0-1 success rate is read as a percentage",
+      real["average success rate"] == "97.13%")
+check("the weakest agent is named with real data",
+      real["lowest success rate"] == "cert-sentinel at 94.26%")
+check("a perfect agent is named", real["agents at 100%"] == "dns-drift")
+check("failures are derived when the API omits them",
+      real["failed runs (derived from rate)"] == 17)
+check("the best rank is reported", real["best rank held"] == 2)
+
+check("platform context counts every listing", real["agents listed on the directory overall"] == 4)
+check("instrumented agents are counted", real["of those, how many report telemetry"] == 3)
+check("self-reported agents are counted",
+      real["of those, how many are self-reported only"] == 1)
+check("unrated agents are counted honestly",
+      real["of those, how many have any human rating"] == 0)
+check("other people's agents are never named",
+      not any("alert-dedupe" in str(v) or "movie-app" in str(v)
+              for v in real.values()))
+check("an empty leaderboard yields no context",
+      material.platform_context([], "") == {})
+
 check("an all-dead fleet yields no facts",
       material.build_facts([AgentRecord("x", ok=False)]) == {})
 check("an empty fleet yields no facts", material.build_facts([]) == {})
@@ -356,6 +415,17 @@ sparse = material.build_facts([AgentRecord("new", ok=True, fields={})])
 check("an agent with no metrics still counts, without inventing numbers",
       sparse["agents in the fleet"] == 1
       and "total runs recorded across the fleet" not in sparse)
+
+check("non-scalar structure is reported, not silently dropped",
+      material.describe_structure({"metrics": {"a": 1}})["metrics"].startswith("object"))
+check("a null field is reported",
+      material.describe_structure({"metrics": None})["metrics"] == "null")
+check("an empty object is reported",
+      material.describe_structure({"metrics": {}})["metrics"] == "empty object {}")
+check("a list is reported with its length",
+      "list of 2" in material.describe_structure({"recent": [{"a": 1}, {"a": 2}]})["recent"])
+check("credential keys are stripped from structure reports too",
+      material.describe_structure({"secret": {"a": 1}}) == {})
 
 check("describe reports a failed read",
       "FAILED" in material.describe([AgentRecord("x", ok=False, error="HTTP 401")]))

@@ -166,9 +166,20 @@ def period_key(granularity: str) -> str:
 
 
 def make_reader(config: dict[str, Any]) -> material.FleetReader:
+    key_env = config["enabler"]["key_env"]
+    key = os.environ.get(key_env, "")
+    if not key:
+        log.warning("%s is not set — the query API will reject every read", key_env)
+    elif key.endswith("...") or "paste" in key.lower() or "your-key" in key.lower():
+        log.error(
+            "%s looks like a placeholder (%r) rather than a real key", key_env, key
+        )
     return material.FleetReader(
         config["enabler"]["base_url"],
-        os.environ.get(config["enabler"]["key_env"], ""),
+        key,
+        path_template=config["enabler"].get(
+            "path_template", "/api/v1/query/agents/{slug}"
+        ),
     )
 
 
@@ -196,7 +207,7 @@ def post_lane(
     records = reader.read_fleet(fleet)
     result["metrics"]["fleet_agents_read"] = sum(1 for r in records if r.ok)
     result["metrics"]["fleet_agents_unreadable"] = sum(1 for r in records if not r.ok)
-    facts = material.build_facts(records)
+    facts = material.build_facts(records, reader.platform)
 
     if dry_run:
         print("\n--- what the Query API returned ---" + material.describe(records))
@@ -256,7 +267,8 @@ def reply_lane(
         log.info("no replies to look at")
         return
 
-    facts = material.build_facts(reader.read_fleet(config["enabler"]["fleet"]))
+    fleet_records = reader.read_fleet(config["enabler"]["fleet"])
+    facts = material.build_facts(fleet_records, reader.platform)
     drafts: list[str] = []
     handled = 0
 
@@ -372,12 +384,30 @@ def main(argv: list[str] | None = None) -> int:
     reader = make_reader(config)
 
     if args.describe_api:
-        records = reader.read_fleet(config["enabler"]["fleet"])
+        fleet = config["enabler"]["fleet"]
+        records = reader.read_fleet(fleet)
         print("--- what the Query API returned ---" + material.describe(records))
-        print("\n--- facts the writer would receive ---")
-        for key, value in sorted(material.build_facts(records).items()):
-            print(f"  {key}: {value}")
-        return 0
+
+        facts = material.build_facts(records, reader.platform)
+        if facts:
+            print("\n--- facts the writer would receive ---")
+            for key, value in sorted(facts.items()):
+                print(f"  {key}: {value}")
+            return 0
+
+        # Nothing readable. Find the right endpoint rather than making the user
+        # guess: the run that surfaces the problem should also surface the fix.
+        print("\n--- no readable records; probing for the right endpoint ---")
+        print("  (a 200 with HTML means the website answered, not the API)\n")
+        for line in reader.probe(fleet[0] if fleet else "dns-drift"):
+            print(line)
+        print(
+            "\nIf one line says USE THIS, put its host in config.yml as "
+            "enabler.base_url,\nand its path (with {slug}) as "
+            "enabler.path_template.\nIf every line says html or 401, the key or "
+            "the auth header is the problem."
+        )
+        return 1
 
     try:
         client = MoltbookClient(os.environ.get("MOLTBOOK_API_KEY", ""))

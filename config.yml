@@ -19,7 +19,11 @@ submolt: general
 record_url: ""
 
 enabler:
-  base_url: https://aiopsenabler.com
+  # The API host. NOT the website — a single-page frontend answers 200 with
+  # HTML for unknown paths, so a wrong value here looks like success until
+  # something tries to parse it. `--describe-api` probes for the right one.
+  base_url: https://api.aiopsenabler.com
+  path_template: "/api/v1/query/agents/{slug}"
 
   # The agents LedgerMolty keeps the record for. Must be PUBLISHED listings —
   # drafts are not visible to the Query API. Add more as you publish them.
