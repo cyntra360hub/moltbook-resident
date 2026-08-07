@@ -1,5 +1,14 @@
 name: LedgerMolty
 
+# LedgerMolty posts to Moltbook, then reports what actually happened to AiOps
+# Enabler using GitHub's own OIDC token — no secret to paste anywhere.
+#
+# The reporting step reads the real outcome out of result.json. That matters:
+# the connect wizard's standalone template sends a hardcoded
+# `"outcome": "success"` on a 30-minute cron whether or not the agent did
+# anything, which turns a verified performance record into a count of cron
+# ticks. Reporting a run that did not happen is worse than not reporting.
+
 on:
   schedule:
     - cron: "41 4,13 * * *"   # twice a day, off the hour
@@ -47,8 +56,8 @@ jobs:
       - run: pip install -r requirements.txt
 
       # The ledger prevents duplicate posts and carries the verification
-      # failure count between runs. Both are why this cache matters: without
-      # it, a retried run can post twice, which the platform treats as spam.
+      # failure count between runs. Without it a retried run can post twice,
+      # which the platform treats as spam.
       - name: Restore ledger
         uses: actions/cache@v4
         with:
@@ -56,7 +65,12 @@ jobs:
           key: resident-state-${{ github.run_id }}
           restore-keys: resident-state-
 
-      - name: Run
+      - name: Start timer
+        run: echo "STARTED_AT=$(date +%s%3N)" >> "$GITHUB_ENV"
+
+      - name: Run LedgerMolty
+        id: run
+        continue-on-error: true      # a failed run must still be REPORTED
         env:
           MOLTBOOK_API_KEY: ${{ secrets.MOLTBOOK_API_KEY }}
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
@@ -65,18 +79,54 @@ jobs:
           python agent.py --once --replies \
             ${{ inputs.dry_run && '--dry-run' || '' }}
 
-      # Drafts contain text derived from other agents' comments. Keep them out
-      # of artifacts; read them in the job log or wire your own notification.
+      - name: Report the real outcome to AiOps Enabler
+        if: always()
+        run: |
+          set -uo pipefail
+
+          # Read what actually happened. A missing result.json means the agent
+          # crashed before writing it, which is itself a failure worth
+          # reporting — never default to success.
+          if [ -f result.json ]; then
+            OUTCOME=$(jq -r '.outcome // "failure"' result.json)
+            SUMMARY=$(jq -r '.summary // ""' result.json)
+          else
+            OUTCOME="failure"
+            SUMMARY="agent produced no result.json"
+          fi
+          [ "$OUTCOME" = "success" ] || OUTCOME="failure"
+
+          DURATION=$(( $(date +%s%3N) - STARTED_AT ))
+          echo "reporting outcome=$OUTCOME duration=${DURATION}ms — $SUMMARY"
+
+          AUD="https://aiopsenabler.com/api/v1/events/github-oidc"
+          OIDC_TOKEN=$(curl -sf \
+            -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=$AUD" | jq -r '.value')
+
+          HTTP_STATUS=$(curl -s -o /tmp/aiops-response.json -w '%{http_code}' \
+            -X POST "https://api.aiopsenabler.com/api/v1/events/github-oidc" \
+            -H "Authorization: Bearer $OIDC_TOKEN" \
+            -H "Content-Type: application/json" \
+            -d "{\"event_type\":\"task_completed\",\"task_id\":\"$GITHUB_RUN_ID\",\"outcome\":\"$OUTCOME\",\"duration_ms\":$DURATION}")
+
+          if [ "$HTTP_STATUS" -lt 200 ] || [ "$HTTP_STATUS" -ge 300 ]; then
+            echo "::error::AiOps Enabler rejected this report (HTTP $HTTP_STATUS)"
+            jq -r '"[\(.detail.category // "unknown")] \(.detail.message // .detail // "no reason given")"' \
+              /tmp/aiops-response.json || cat /tmp/aiops-response.json
+            jq -r '.detail.remediation // empty' /tmp/aiops-response.json
+            exit 1
+          fi
+          echo "reported OK"
+
+      # Drafts contain text derived from other agents' comments. Read them in
+      # the log; do not upload them as an artifact.
       - name: Show reply drafts
         if: always()
         run: cat state/drafts.md 2>/dev/null || echo "no drafts this run"
 
-      # ---------------------------------------------------------------- #
-      # Replace with the snippet the AiOps Enabler connect wizard generates
-      # for this repo (OIDC flavour — keyless, so no fourth secret).
-      # ---------------------------------------------------------------- #
-      - name: Report run
-        if: always()
-        run: |
-          cat result.json
-          # <-- paste the generated reporting step here
+      # The job's own status must reflect the agent's, or a broken LedgerMolty
+      # shows a green tick forever.
+      - name: Fail the job if the agent failed
+        if: steps.run.outcome == 'failure'
+        run: exit 1
