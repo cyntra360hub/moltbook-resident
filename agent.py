@@ -43,7 +43,17 @@ from resident import compose, guard, material, triage
 from resident.moltbook import MoltbookClient, MoltbookError, SuspensionRisk
 from resident.state import State
 
-VERSION = "1.0.0"
+# Windows consoles default to a legacy codepage, so an em-dash in a draft
+# renders as garbage and you cannot tell whether the text or just the display
+# is broken. The payload was always fine; this makes the preview trustworthy.
+for _stream in (sys.stdout, sys.stderr):
+    if hasattr(_stream, "reconfigure"):
+        try:
+            _stream.reconfigure(encoding="utf-8", errors="replace")
+        except (ValueError, OSError):
+            pass
+
+VERSION = "1.1.0"
 AGENT = "moltbook-resident"
 log = logging.getLogger(AGENT)
 
@@ -220,11 +230,45 @@ def post_lane(
         )
         return
 
-    title, body = compose.compose_post(facts, model)
+    if dry_run:
+        # Print the facts, not just the raw API dump. Without this you cannot
+        # check a figure in the draft against what the agent was actually told,
+        # which makes reviewing a post guesswork.
+        print("\n--- facts given to the writer (every figure must come from here) ---")
+        for key, value in sorted(facts.items()):
+            print(f"  {key}: {value}")
 
-    verdict = guard.check_post(title, body, allowed_url=config["record_url"])
-    result["metrics"]["guard_checks"] += 1
-    if not verdict:
+    attempts = max(1, int(config["model"]["max_retries"]) + 1)
+    title = body = ""
+    verdict = guard.Verdict(ok=False, reasons=["not composed"])
+
+    for attempt in range(1, attempts + 1):
+        title, body = compose.compose_post(facts, model)
+        result["metrics"]["guard_checks"] += 1
+
+        verdict = guard.check_post(title, body, allowed_url=config["record_url"])
+        numbers = guard.check_numbers(f"{title} {body}", facts)
+        result["metrics"]["guard_checks"] += 1
+
+        if verdict.ok and numbers.ok:
+            verdict = numbers
+            break
+
+        # A numeric slip is worth another try — the model usually gets it right
+        # on a re-roll, and a blocked post means no post at all that day.
+        # A policy breach (a bad link, promotional phrasing) is not retried:
+        # that is a prompt problem, not a dice roll.
+        if verdict.ok and not numbers.ok:
+            result["metrics"]["numeric_retries"] += 1
+            log.warning(
+                "attempt %d stated a figure not in the facts (%s) — recomposing",
+                attempt, "; ".join(numbers.reasons),
+            )
+            verdict = numbers
+            continue
+        break
+
+    if not verdict.ok:
         result["metrics"]["guard_blocks"] += 1
         result["blocked"].append({"kind": "post", "reasons": verdict.reasons})
         log.error("post blocked by guard: %s", "; ".join(verdict.reasons))
@@ -306,7 +350,12 @@ def reply_lane(
                 continue
 
             verdict = guard.check_comment(draft, allowed_url=config["record_url"])
-            result["metrics"]["guard_checks"] += 1
+            numbers = guard.check_numbers(draft, facts)
+            result["metrics"]["guard_checks"] += 2
+            if not verdict.ok:
+                pass
+            elif not numbers.ok:
+                verdict = numbers
             if not verdict:
                 result["metrics"]["guard_blocks"] += 1
                 result["blocked"].append(
@@ -376,6 +425,7 @@ def main(argv: list[str] | None = None) -> int:
             "comments_triaged": 0, "comments_flagged_hostile": 0,
             "guard_checks": 0, "guard_blocks": 0,
             "fleet_agents_read": 0, "fleet_agents_unreadable": 0,
+            "numeric_retries": 0,
         },
         "published": [], "blocked": [], "errors": [],
     }

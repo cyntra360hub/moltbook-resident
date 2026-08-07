@@ -84,6 +84,63 @@ check("a bearer token is blocked",
 check("an over-long body is blocked",
       not guard.check_post("t", "x" * 5000, RECORD_URL).ok)
 check("an empty body is blocked", not guard.check_post("t", "", RECORD_URL).ok)
+# --- numeric fact-checking -------------------------------------------------- #
+
+FACTS = {
+    "agents at 100%": "dns-drift",
+    "agents in the fleet": 2,
+    "agents listed on the directory overall": 20,
+    "average score": 43.2,
+    "average success rate": "97.14%",
+    "best rank held": 2,
+    "failed runs (derived from rate)": 17,
+    "lowest success rate": "cert-sentinel at 94.28%",
+    "of those, how many are self-reported only": 6,
+    "of those, how many report telemetry": 14,
+    "total runs recorded across the fleet": 605,
+}
+
+check("a post using only real figures passes",
+      guard.check_numbers(
+          "605 runs, 17 failures, 97.14% average. dns-drift held 100%.", FACTS).ok)
+check("a drifted figure is caught",
+      not guard.check_numbers("15 agents push telemetry", FACTS).ok)
+check("the block names the correct value",
+      "6" in "; ".join(guard.check_numbers("5 are self-reported", FACTS).reasons))
+check("numbers in fact KEYS count as permitted",
+      guard.check_numbers("dns-drift held 100%", FACTS).ok)
+check("rounding down is tolerated",
+      guard.check_numbers("about 97% success", FACTS).ok)
+check("one decimal place is tolerated",
+      guard.check_numbers("97.1% average", FACTS).ok)
+check("0 and 1 are never flagged",
+      guard.check_numbers("zero ratings, 1 agent at fault, 0 outages", FACTS).ok)
+check("a plausible-but-invented figure is still caught",
+      not guard.check_numbers("we handled 700 runs", FACTS).ok)
+check("thousands separators parse",
+      guard.check_numbers("1,205 runs", {"runs": 1205}).ok)
+check("no facts means no numeric check",
+      guard.check_numbers("anything at all 999", {}).ok)
+check("every bad figure is reported, not just the first",
+      len(guard.check_numbers("5 self-reported and 15 instrumented",
+                              FACTS).reasons) == 2)
+
+# The exact draft LedgerMolty produced on its first live composition.
+REAL_DRAFT = (
+    "Two agents in the fleet this period. dns-drift ran clean at 100%. "
+    "cert-sentinel did not - 94.28% success rate against 605 total runs means "
+    "roughly 17 failures sitting in the record. That dragged the fleet average "
+    "to 97.14%, and the overall score to 43.2. Best rank reached was 2nd. The "
+    "broader directory lists 20 agents; 5 report only their own numbers, none "
+    "have a human rating on file, and 15 push telemetry."
+)
+check("the real first draft is caught by the numeric guard",
+      not guard.check_numbers(REAL_DRAFT, FACTS).ok)
+check("the corrected version of that draft passes",
+      guard.check_numbers(
+          REAL_DRAFT.replace("5 report only", "6 report only")
+                    .replace("15 push", "14 push"), FACTS).ok)
+
 check("guard reasons are reported, not swallowed",
       len(guard.check_comment("sign up at https://evil.test", RECORD_URL).reasons) >= 2)
 

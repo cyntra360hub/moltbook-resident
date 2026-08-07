@@ -24,6 +24,13 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
+from typing import Any
+
+NUMBER_RE = re.compile(r"\d+(?:[.,]\d+)*")
+
+# 0 and 1 appear constantly in ordinary prose ("one agent", "zero ratings")
+# and checking them produces noise without catching real drift.
+TRIVIAL_NUMBERS = {0.0, 1.0}
 
 MAX_POST_TITLE = 300
 MAX_POST_BODY = 3000
@@ -128,6 +135,68 @@ def _check_text(text: str, limit: int, allowed_url: str, label: str) -> list[str
         reasons.append(f"{label} contains something shaped like a credential")
 
     return reasons
+
+
+def _numbers_in(text: str) -> list[float]:
+    found: list[float] = []
+    for match in NUMBER_RE.finditer(text or ""):
+        try:
+            found.append(float(match.group(0).replace(",", "")))
+        except ValueError:
+            continue
+    return found
+
+
+def allowed_numbers(facts: dict[str, Any]) -> set[float]:
+    """Every number the agent is permitted to state.
+
+    Drawn from both keys and values, because a fact like
+    `"agents at 100%": "dns-drift"` carries its figure in the key.
+    """
+    allowed: set[float] = set()
+    for key, value in (facts or {}).items():
+        for number in _numbers_in(f"{key} {value}"):
+            allowed.add(number)
+            allowed.add(round(number))
+            allowed.add(round(number, 1))
+    return allowed
+
+
+def check_numbers(text: str, facts: dict[str, Any]) -> Verdict:
+    """Every figure in the draft must trace back to a fact.
+
+    A language model asked to write about 14 instrumented agents will
+    occasionally write 15. Usually that is harmless; for an agent whose entire
+    claim is that its numbers are verified, it is the worst possible bug — and
+    it is invisible unless something checks arithmetic rather than tone.
+
+    Rounding is permitted (97.14 may be written as 97.1 or 97), invention is
+    not.
+    """
+    if not facts:
+        return Verdict(ok=True)
+
+    allowed = allowed_numbers(facts)
+    reasons: list[str] = []
+
+    for number in _numbers_in(text):
+        if number in TRIVIAL_NUMBERS or number in allowed:
+            continue
+        # Accept a rounded form of any permitted figure.
+        if any(
+            abs(number - candidate) < 0.051
+            or round(candidate, 1) == number
+            or round(candidate) == number
+            for candidate in allowed
+        ):
+            continue
+        nearest = min(allowed, key=lambda c: abs(c - number)) if allowed else None
+        hint = f" (nearest fact: {nearest})" if nearest is not None else ""
+        reasons.append(
+            f"states {number:g}, which is not in the facts provided{hint}"
+        )
+
+    return Verdict(ok=not reasons, reasons=reasons)
 
 
 def check_post(title: str, body: str, allowed_url: str = "") -> Verdict:
