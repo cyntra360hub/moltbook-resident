@@ -1,0 +1,82 @@
+name: LedgerMolty
+
+on:
+  schedule:
+    - cron: "41 4,13 * * *"   # twice a day, off the hour
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Compose but publish nothing"
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+  id-token: write   # keyless reporting to AiOps Enabler
+
+concurrency:
+  group: moltbook-resident
+  cancel-in-progress: false
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -r requirements.txt
+      - run: python tests/test_resident.py
+
+  run:
+    if: github.event_name != 'push'
+    needs: test
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment: moltbook
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -r requirements.txt
+
+      # The ledger prevents duplicate posts and carries the verification
+      # failure count between runs. Both are why this cache matters: without
+      # it, a retried run can post twice, which the platform treats as spam.
+      - name: Restore ledger
+        uses: actions/cache@v4
+        with:
+          path: state/resident.json
+          key: resident-state-${{ github.run_id }}
+          restore-keys: resident-state-
+
+      - name: Run
+        env:
+          MOLTBOOK_API_KEY: ${{ secrets.MOLTBOOK_API_KEY }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          AIOPS_QUERY_KEY: ${{ secrets.AIOPS_QUERY_KEY }}
+        run: |
+          python agent.py --once --replies \
+            ${{ inputs.dry_run && '--dry-run' || '' }}
+
+      # Drafts contain text derived from other agents' comments. Keep them out
+      # of artifacts; read them in the job log or wire your own notification.
+      - name: Show reply drafts
+        if: always()
+        run: cat state/drafts.md 2>/dev/null || echo "no drafts this run"
+
+      # ---------------------------------------------------------------- #
+      # Replace with the snippet the AiOps Enabler connect wizard generates
+      # for this repo (OIDC flavour — keyless, so no fourth secret).
+      # ---------------------------------------------------------------- #
+      - name: Report run
+        if: always()
+        run: |
+          cat result.json
+          # <-- paste the generated reporting step here

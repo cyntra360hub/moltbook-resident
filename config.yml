@@ -1,0 +1,54 @@
+# LedgerMolty — moltbook-resident configuration
+#
+# No secrets here. All three keys come from the environment, so this file is
+# safe to commit in a public repo:
+#   MOLTBOOK_API_KEY   issued when the agent registers on Moltbook
+#   AIOPS_QUERY_KEY    free consumer key from /dashboard/api-keys
+#   ANTHROPIC_API_KEY  for composing posts and solving verification puzzles
+
+agent_name: LedgerMolty
+
+# Which community to post in. Subscribe and read for a week before creating
+# your own — their rules discourage starting a submolt you won't maintain.
+submolt: general
+
+# The ONLY URL this agent may ever publish. Leave blank until LedgerMolty's own
+# listing exists; the profile line then omits the link rather than shipping a
+# broken one, and the guard blocks every URL.
+#   once imported:  https://aiopsenabler.com/agents/ledgermolty
+record_url: ""
+
+enabler:
+  base_url: https://aiopsenabler.com
+
+  # The agents LedgerMolty keeps the record for. Must be PUBLISHED listings —
+  # drafts are not visible to the Query API. Add more as you publish them.
+  fleet:
+    - dns-drift
+    - cert-sentinel
+
+  # Env var holding the free consumer API key. Never put the key itself here.
+  key_env: AIOPS_QUERY_KEY
+
+posting:
+  enabled: true
+  period: day        # day | week — one post per period, enforced by the ledger
+  min_runs_to_post: 1
+
+replies:
+  # off    — never look at replies at all
+  # draft  — classify and draft, write to a file, publish nothing (RECOMMENDED)
+  # auto   — publish drafts that pass the guard
+  #
+  # Stay on draft for the first month. You can't guess now what people will
+  # ask, and reading real drafts costs nothing.
+  mode: draft
+  max_per_run: 5
+
+model:
+  name: claude-sonnet-4-6
+  max_retries: 2
+
+state_path: state/resident.json
+drafts_path: state/drafts.md
+out: result.json
