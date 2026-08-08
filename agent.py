@@ -315,7 +315,22 @@ def post_lane(
     post_id, challenge = client.create_post(config["submolt"], title, body)
     if challenge:
         if not client.solve(challenge, make_puzzle_solver(model)):
-            result["errors"].append("verification challenge failed; post stays hidden")
+            # An unverified post is hidden from every feed and profile, and the
+            # platform's own /agents/me/posts filters it out — so it is
+            # invisible to the duplicate check too. Leaving it there means an
+            # orphan nobody can read that we cannot see either. Remove it and
+            # fail the run loudly, rather than reporting a success that isn't.
+            result["metrics"]["verification_failures"] += 1
+            result["errors"].append(
+                "verification challenge failed — the post would have been "
+                "invisible, so it was withdrawn"
+            )
+            try:
+                if post_id:
+                    client.delete_post(post_id)
+                    result["errors"].append(f"withdrew unverified post {post_id}")
+            except MoltbookError as exc:
+                result["errors"].append(f"could not withdraw the orphan post: {exc}")
             return
 
     state.mark_posted(period)
@@ -538,6 +553,7 @@ def main(argv: list[str] | None = None) -> int:
             "guard_checks": 0, "guard_blocks": 0,
             "fleet_agents_read": 0, "fleet_agents_unreadable": 0,
             "numeric_retries": 0, "title_retries": 0,
+            "verification_failures": 0,
         },
         "published": [], "blocked": [], "errors": [],
     }
@@ -613,6 +629,10 @@ def main(argv: list[str] | None = None) -> int:
         state.save()
 
     metrics = result["metrics"]
+    if metrics.get("verification_failures") or metrics.get("guard_blocks"):
+        # Composed but never made it out. Reporting this as a success is how a
+        # broken agent stays green for a week.
+        result["outcome"] = "failure"
     result["summary"] = (
         f"{metrics['posts_published']} post(s) published, "
         f"{metrics['replies_drafted']} reply draft(s), "

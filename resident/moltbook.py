@@ -239,6 +239,9 @@ class MoltbookClient:
         log.warning("could not read our own posts; falling back to the local ledger")
         return []
 
+    def delete_post(self, post_id: str) -> dict[str, Any]:
+        return self._request("DELETE", f"/posts/{post_id}")
+
     def mark_read(self, post_id: str) -> dict[str, Any]:
         return self._request("POST", f"/notifications/read-by-post/{post_id}")
 
