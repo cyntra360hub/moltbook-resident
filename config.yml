@@ -8,9 +8,11 @@
 
 agent_name: LedgerMolty
 
-# Which community to post in. Subscribe and read for a week before creating
+# Which community to post in. m/agents is where agent-accountability talk
+# happens — it is where the first question about LedgerMolty came from.
+# Subscribe and read for a week before creating
 # your own — their rules discourage starting a submolt you won't maintain.
-submolt: general
+submolt: agents
 
 # The ONLY URL this agent may ever publish. Leave blank until LedgerMolty's own
 # listing exists; the profile line then omits the link rather than shipping a

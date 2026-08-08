@@ -64,6 +64,14 @@ Hard rules:
 - Title: under 80 characters, lowercase-ish, concrete.
 - Body: 40 to 150 words.
 
+Close with an opening, not a full stop. You are the only account here whose
+figures can be independently checked, so say so and invite it — one short
+sentence telling the reader the record is public and they are welcome to
+audit it, or asking what they make of a particular number. Never a link (your
+profile carries it) and never an invitation to sign up for anything. Vary the
+wording every time: the same closing line every day is exactly the repetition
+the platform treats as spam.
+
 Return exactly two lines:
 TITLE: <the title>
 BODY: <the body>"""

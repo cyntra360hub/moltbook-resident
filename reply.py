@@ -21,6 +21,7 @@ from pathlib import Path
 
 import yaml
 
+from agent import Anthropic, make_puzzle_solver
 from resident import guard
 from resident.moltbook import MoltbookClient, MoltbookError
 
@@ -33,14 +34,33 @@ def main() -> int:
     parser.add_argument("--parent", default="", help="comment id, to reply to a comment")
     parser.add_argument("--config", default="config.yml")
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument(
+        "--verify-only",
+        metavar="CODE",
+        help="skip posting; just answer an outstanding challenge, e.g. after a "
+             "solver failure. Pair with --answer.",
+    )
+    parser.add_argument("--answer", help="the numeric answer for --verify-only")
     args = parser.parse_args()
 
+    if args.verify_only:
+        client = MoltbookClient(os.environ.get("MOLTBOOK_API_KEY", ""))
+        if not args.answer:
+            print("--verify-only needs --answer", file=sys.stderr)
+            return 1
+        response = client._request(
+            "POST", "/verify",
+            {"verification_code": args.verify_only, "answer": f"{float(args.answer):.2f}"},
+        )
+        print("verified" if response.get("success") else f"rejected: {response}")
+        return 0 if response.get("success") else 1
+
+    config = yaml.safe_load(Path(args.config).read_text(encoding="utf-8")) or {}
     text = Path(args.file).read_text(encoding="utf-8").strip() if args.file else args.text
     if not text:
         print("nothing to post: pass text or --file", file=sys.stderr)
         return 1
 
-    config = yaml.safe_load(Path(args.config).read_text(encoding="utf-8")) or {}
     record_url = str(config.get("record_url", ""))
 
     # Same guard the agent uses. A hand-written reply can still contain a stray
@@ -59,10 +79,28 @@ def main() -> int:
 
     try:
         client = MoltbookClient(os.environ.get("MOLTBOOK_API_KEY", ""))
+
+        # The local parser handles simple two-number challenges. Longer,
+        # multi-clause ones ("claws press on water pressure and push, claw-force
+        # is thirty-two newtons...") need the model — which is exactly what the
+        # fallback is for, and passing None here was a bug.
+        solver = None
+        if os.environ.get("ANTHROPIC_API_KEY"):
+            model_name = str((config.get("model") or {}).get("name", "claude-sonnet-4-6"))
+            solver = make_puzzle_solver(
+                Anthropic(os.environ["ANTHROPIC_API_KEY"], model_name)
+            )
+        else:
+            print(
+                "note: ANTHROPIC_API_KEY not set, so only the local puzzle parser "
+                "is available",
+                file=sys.stderr,
+            )
+
         comment_id, challenge = client.create_comment(args.post_id, text, args.parent)
         if challenge:
             print(f"solving verification: {challenge.challenge_text[:70]}...")
-            if not client.solve(challenge, None):
+            if not client.solve(challenge, solver):
                 print(
                     "could not solve the puzzle locally. Solve it by hand and POST "
                     "the answer to /api/v1/verify with this code:\n  "
