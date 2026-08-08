@@ -24,6 +24,8 @@ class State:
             "posted_periods": [],
             "consecutive_verify_failures": 0,
             "replied_comment_ids": [],
+            "replied_post_ids": [],
+            "recent_titles": [],
             "last_post_at": "",
         }
         if self.path.exists():
@@ -39,6 +41,8 @@ class State:
         # Keep the lists bounded so the file cannot grow without limit.
         self.data["posted_periods"] = self.data["posted_periods"][-90:]
         self.data["replied_comment_ids"] = self.data["replied_comment_ids"][-500:]
+        self.data["replied_post_ids"] = self.data["replied_post_ids"][-500:]
+        self.data["recent_titles"] = self.data["recent_titles"][-10:]
         tmp = self.path.with_suffix(".tmp")
         tmp.write_text(json.dumps(self.data, indent=2) + "\n", encoding="utf-8")
         tmp.replace(self.path)
@@ -59,6 +63,21 @@ class State:
     def mark_replied(self, comment_id: str) -> None:
         if comment_id and comment_id not in self.data["replied_comment_ids"]:
             self.data["replied_comment_ids"].append(comment_id)
+
+    @property
+    def recent_titles(self) -> list[str]:
+        return list(self.data.get("recent_titles", []))
+
+    def remember_title(self, title: str) -> None:
+        if title and title not in self.data["recent_titles"]:
+            self.data["recent_titles"].append(title)
+
+    def already_replied_to_post(self, post_id: str) -> bool:
+        return post_id in self.data["replied_post_ids"]
+
+    def mark_replied_to_post(self, post_id: str) -> None:
+        if post_id and post_id not in self.data["replied_post_ids"]:
+            self.data["replied_post_ids"].append(post_id)
 
     @property
     def verify_failures(self) -> int:

@@ -191,6 +191,57 @@ class MoltbookClient:
     def comments(self, post_id: str, limit: int = 35) -> dict[str, Any]:
         return self._request("GET", f"/posts/{post_id}/comments?sort=new&limit={limit}")
 
+    def me(self) -> dict[str, Any]:
+        """Our own profile — needed to tell our posts from other people's."""
+        return self._request("GET", "/agents/me")
+
+    def post(self, post_id: str) -> dict[str, Any]:
+        """One post, including its author and body.
+
+        `/home` reports activity on posts we were MENTIONED in as well as posts
+        we wrote, and does not reliably distinguish them. Fetching the post and
+        comparing author ids is the only dependable test — and it matters,
+        because replying inside a stranger's thread is the behaviour this agent
+        exists not to have.
+        """
+        return self._request("GET", f"/posts/{post_id}")
+
+    def my_recent_posts(self, name: str, limit: int = 10) -> list[dict[str, Any]]:
+        """Our own recent posts, straight from the platform.
+
+        The local ledger cannot be the source of truth for "did I already post
+        today": a laptop run and a CI run keep separate state files and never
+        see each other, which is how three near-identical posts went out. The
+        platform knows what we actually published, so ask it.
+
+        Returns [] if no endpoint shape works — the caller then falls back to
+        the local ledger rather than posting blind.
+        """
+        # /agents/me/posts is the shape that actually works — confirmed against
+        # the live API. The name-based paths 404, but are kept as fallbacks in
+        # case the endpoint changes.
+        for path in (
+            f"/agents/me/posts?limit={limit}",
+            f"/agents/{name}/posts?limit={limit}",
+            f"/agents/{name}?include=posts",
+        ):
+            try:
+                data = self._request("GET", path)
+            except MoltbookError:
+                continue
+            for key in ("posts", "items", "results"):
+                value = data.get(key)
+                if isinstance(value, list):
+                    return [p for p in value if isinstance(p, dict)]
+            agent = data.get("agent")
+            if isinstance(agent, dict) and isinstance(agent.get("posts"), list):
+                return [p for p in agent["posts"] if isinstance(p, dict)]
+        log.warning("could not read our own posts; falling back to the local ledger")
+        return []
+
+    def mark_read(self, post_id: str) -> dict[str, Any]:
+        return self._request("POST", f"/notifications/read-by-post/{post_id}")
+
     # --- writes ---------------------------------------------------------- #
 
     def set_description(self, description: str) -> dict[str, Any]:

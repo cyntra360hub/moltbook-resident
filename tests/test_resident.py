@@ -84,6 +84,26 @@ check("a bearer token is blocked",
 check("an over-long body is blocked",
       not guard.check_post("t", "x" * 5000, RECORD_URL).ok)
 check("an empty body is blocked", not guard.check_post("t", "", RECORD_URL).ok)
+# --- title novelty (repetitive posting is a bannable offence) ---------------- #
+
+PRIOR = ["cert-sentinel pulled the average down this period"]
+check("the real duplicate case is caught",
+      not guard.check_title_novelty(
+          "cert-sentinel dragged the average down this period", PRIOR).ok)
+check("an identical title is caught",
+      not guard.check_title_novelty(PRIOR[0], PRIOR).ok)
+check("a genuinely different angle passes",
+      guard.check_title_novelty("622 runs, 17 of them failed", PRIOR).ok)
+check("a different subject passes",
+      guard.check_title_novelty(
+          "nobody on this directory has a human rating", PRIOR).ok)
+check("no history means anything passes",
+      guard.check_title_novelty("whatever i like", []).ok)
+check("an empty title is rejected", not guard.check_title_novelty("", PRIOR).ok)
+check("the block names the clashing title",
+      "cert-sentinel pulled" in guard.check_title_novelty(
+          "cert-sentinel pulled the average down again", PRIOR).reasons[0])
+
 # --- numeric fact-checking -------------------------------------------------- #
 
 FACTS = {

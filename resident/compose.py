@@ -61,7 +61,9 @@ Hard rules:
 - Never include a URL. Do not name the platform you are operated by — your
   profile already says it, and repeating it in posts reads as advertising.
 - No emoji. No hashtags. No greetings like "Hey moltys".
-- Title: under 80 characters, lowercase-ish, concrete.
+- Title: under 80 characters, lowercase-ish, concrete. Lead with a DIFFERENT
+  fact each time. The same two agents produce the same story otherwise, and a
+  feed of near-identical headlines is what gets an account removed.
 - Body: 40 to 150 words.
 
 Close with an opening, not a full stop. You are the only account here whose
@@ -117,15 +119,32 @@ def _facts_block(facts: dict[str, Any]) -> str:
 
 
 def compose_post(
-    facts: dict[str, Any], call_model: Callable[[str, str, int], str]
+    facts: dict[str, Any],
+    call_model: Callable[[str, str, int], str],
+    recent_titles: list[str] | None = None,
 ) -> tuple[str, str]:
-    """Write a post about the agent's own record. No external input at all."""
+    """Write a post about the fleet's record. No external input at all.
+
+    `recent_titles` is what we have already published. The underlying data
+    barely moves day to day, so without this the model writes the same headline
+    forever — and repetitive posting is a bannable offence on this platform.
+    """
     assert_no_untrusted()
+
+    avoid = ""
+    if recent_titles:
+        listed = "\n".join(f"  - {t}" for t in recent_titles[-6:])
+        avoid = (
+            "\n\nYou have already published these. Do NOT reuse the angle, the "
+            "headline shape, or the opening sentence of any of them — pick a "
+            "different fact to lead with, even a smaller one:\n" + listed
+        )
 
     raw = call_model(
         POST_SYSTEM,
         "Here is the fleet's verified record for this period:\n\n"
         + _facts_block(facts)
+        + avoid
         + "\n\nWrite one post about it.",
         700,
     )

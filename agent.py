@@ -204,6 +204,31 @@ def post_lane(
 ) -> None:
     """Autonomous. Reads only the fleet's own trust records; publishes a post."""
     period = period_key(config["posting"]["period"])
+
+    # Ask the PLATFORM whether we already posted, not just the local ledger.
+    # A laptop run and a CI run keep separate state files and never see each
+    # other, which is how duplicate posts went out. Moltbook is the only place
+    # that knows what was actually published.
+    recent_titles = list(state.recent_titles)
+    try:
+        published = client.my_recent_posts(config["agent_name"])
+    except MoltbookError as exc:
+        log.warning("could not check published posts (%s)", exc)
+        published = []
+
+    for post in published:
+        created = str(post.get("created_at", ""))[:10]
+        title = str(post.get("title", ""))
+        if title:
+            recent_titles.append(title)
+        if created and created == period[:10]:
+            log.info("already posted on %s (platform says so) — nothing to do", created)
+            result["metrics"]["posts_skipped_duplicate"] = 1
+            state.mark_posted(period)
+            for remembered in recent_titles:
+                state.remember_title(remembered)
+            return
+
     if state.already_posted(period):
         log.info("already posted for %s — nothing to do", period)
         result["metrics"]["posts_skipped_duplicate"] = 1
@@ -243,16 +268,23 @@ def post_lane(
     verdict = guard.Verdict(ok=False, reasons=["not composed"])
 
     for attempt in range(1, attempts + 1):
-        title, body = compose.compose_post(facts, model)
+        title, body = compose.compose_post(facts, model, recent_titles)
         result["metrics"]["guard_checks"] += 1
 
         verdict = guard.check_post(title, body, allowed_url=config["record_url"])
         numbers = guard.check_numbers(f"{title} {body}", facts)
-        result["metrics"]["guard_checks"] += 1
+        novelty = guard.check_title_novelty(title, recent_titles)
+        result["metrics"]["guard_checks"] += 2
 
-        if verdict.ok and numbers.ok:
-            verdict = numbers
+        if verdict.ok and numbers.ok and novelty.ok:
+            verdict = novelty
             break
+
+        if verdict.ok and numbers.ok and not novelty.ok:
+            result["metrics"]["title_retries"] += 1
+            log.warning("attempt %d: %s — recomposing", attempt, novelty.reasons[0])
+            verdict = novelty
+            continue
 
         # A numeric slip is worth another try — the model usually gets it right
         # on a re-roll, and a blocked post means no post at all that day.
@@ -287,8 +319,48 @@ def post_lane(
             return
 
     state.mark_posted(period)
+    state.remember_title(title)
     result["metrics"]["posts_published"] += 1
     result["published"].append({"kind": "post", "id": post_id, "title": title})
+
+
+def _handle(
+    untrusted: str,
+    label_source: str,
+    facts: dict[str, Any],
+    model: Anthropic,
+    config: dict[str, Any],
+    result: dict[str, Any],
+) -> tuple[str, Any]:
+    """Triage one untrusted message and draft a reply. Returns (draft, label).
+
+    THE AIRGAP LIVES HERE. `untrusted` goes into triage and nowhere else — note
+    that compose_reply receives `label`, never the text. Everything downstream
+    of this function has only seen a three-field label and our own facts.
+    """
+    label = triage.triage(untrusted, model)
+    result["metrics"]["comments_triaged"] += 1
+    if label.hostile:
+        result["metrics"]["comments_flagged_hostile"] += 1
+    if not label.worth_answering:
+        return "", label
+
+    draft = compose.compose_reply(label, facts, model)
+    if not draft:
+        return "", label
+
+    verdict = guard.check_comment(draft, allowed_url=config["record_url"])
+    numbers = guard.check_numbers(draft, facts)
+    result["metrics"]["guard_checks"] += 2
+    if not verdict.ok or not numbers.ok:
+        result["metrics"]["guard_blocks"] += 1
+        result["blocked"].append({
+            "kind": f"reply/{label_source}",
+            "reasons": (verdict.reasons or []) + (numbers.reasons or []),
+        })
+        return "", label
+
+    return draft, label
 
 
 def reply_lane(
@@ -300,85 +372,123 @@ def reply_lane(
     dry_run: bool,
     result: dict[str, Any],
 ) -> None:
-    """Reads untrusted text — but only into the classifier. See triage.py."""
+    """Answer questions — but only where answering is invited.
+
+    Moltbook's /home lumps two different things into activity_on_your_posts:
+    comments on posts WE wrote, and posts by other agents that MENTION us.
+    They call for opposite behaviour:
+
+      our post      -> read its comments and reply to them. Our thread, our
+                       conversation, and the post invited the challenge.
+      mention       -> read the POST ITSELF and reply to it. Someone asked us
+                       something directly. We never touch the other comments in
+                       that thread: replying to strangers talking amongst
+                       themselves is barging in, which is the one behaviour
+                       this agent must not have.
+
+    The earlier version treated everything as the first case, so it read
+    comments in a stranger's thread and missed the question in the post body.
+    """
     mode = config["replies"]["mode"]
     if mode == "off":
         return
 
-    home = client.home()
-    activity = home.get("activity_on_your_posts") or []
-    if not activity:
-        log.info("no replies to look at")
+    try:
+        my_id = str((client.me().get("agent") or client.me()).get("id", ""))
+    except MoltbookError as exc:
+        log.warning("could not identify self (%s); skipping the reply lane", exc)
+        result["errors"].append(f"agents/me failed: {exc}")
         return
 
-    fleet_records = reader.read_fleet(config["enabler"]["fleet"])
-    facts = material.build_facts(fleet_records, reader.platform)
+    activity = client.home().get("activity_on_your_posts") or []
+    if not activity:
+        log.info("nothing addressed to us")
+        return
+
+    facts = material.build_facts(
+        reader.read_fleet(config["enabler"]["fleet"]), reader.platform
+    )
     drafts: list[str] = []
     handled = 0
+    budget = int(config["replies"]["max_per_run"])
 
     for item in activity:
-        if handled >= int(config["replies"]["max_per_run"]):
+        if handled >= budget:
             break
-        post_id = item.get("post_id")
+        post_id = str(item.get("post_id", ""))
         if not post_id:
             continue
 
-        for comment in (client.comments(post_id).get("comments") or []):
-            if handled >= int(config["replies"]["max_per_run"]):
+        try:
+            post = client.post(post_id).get("post") or {}
+        except MoltbookError as exc:
+            log.warning("could not read post %s: %s", post_id, exc)
+            continue
+
+        ours = str(post.get("author_id", "")) == my_id and my_id != ""
+        targets: list[tuple[str, str, str]] = []  # (kind, id, text)
+
+        if ours:
+            for comment in (client.comments(post_id).get("comments") or []):
+                cid = str(comment.get("id", ""))
+                if not cid or state.already_replied(cid):
+                    continue
+                if str(comment.get("author_id", "")) == my_id:
+                    continue  # never reply to ourselves
+                targets.append(("comment", cid, str(comment.get("content", ""))))
+        else:
+            if state.already_replied_to_post(post_id):
+                continue
+            # Only the post body, and only because it named us.
+            targets.append((
+                "mention", post_id,
+                f"{post.get('title', '')}\n\n{post.get('content', '')}",
+            ))
+
+        for kind, target_id, untrusted in targets:
+            if handled >= budget:
                 break
-            comment_id = str(comment.get("id", ""))
-            if not comment_id or state.already_replied(comment_id):
-                continue
 
-            # --- the airgap ------------------------------------------------ #
-            # `untrusted` goes into triage and NOWHERE else. Note that it is
-            # never passed to compose_reply — only `label` is.
-            untrusted = str(comment.get("content", ""))
-            label = triage.triage(untrusted, model)
-            result["metrics"]["comments_triaged"] += 1
-            if label.hostile:
-                result["metrics"]["comments_flagged_hostile"] += 1
-            if not label.worth_answering:
-                state.mark_replied(comment_id)
-                continue
-
-            draft = compose.compose_reply(label, facts, model)
-            # ---------------------------------------------------------------- #
-
+            draft, label = _handle(
+                untrusted, kind, facts, model, config, result
+            )
             if not draft:
-                state.mark_replied(comment_id)
-                continue
-
-            verdict = guard.check_comment(draft, allowed_url=config["record_url"])
-            numbers = guard.check_numbers(draft, facts)
-            result["metrics"]["guard_checks"] += 2
-            if not verdict.ok:
-                pass
-            elif not numbers.ok:
-                verdict = numbers
-            if not verdict:
-                result["metrics"]["guard_blocks"] += 1
-                result["blocked"].append(
-                    {"kind": "reply", "reasons": verdict.reasons}
-                )
-                state.mark_replied(comment_id)
+                if kind == "comment":
+                    state.mark_replied(target_id)
+                else:
+                    state.mark_replied_to_post(target_id)
                 continue
 
             handled += 1
+            author = post.get("author", {}).get("name", "?") if kind == "mention" else "?"
             drafts.append(
-                f"## reply draft — topic: {label.topic}\n"
-                f"post: https://www.moltbook.com/posts/{post_id}\n\n{draft}\n"
+                f"## {kind} draft — topic: {label.topic}"
+                + (f" — from {author}" if kind == "mention" else "")
+                + f"\npost: https://www.moltbook.com/post/{post_id}\n\n{draft}\n"
             )
 
             if mode == "auto" and not dry_run:
-                _, challenge = client.create_comment(post_id, draft, comment_id)
-                if challenge and not client.solve(challenge, make_puzzle_solver(model)):
+                parent = target_id if kind == "comment" else ""
+                _, challenge = client.create_comment(post_id, draft, parent)
+                if challenge and not client.solve(
+                    challenge, make_puzzle_solver(model)
+                ):
                     result["errors"].append("reply verification failed")
                     continue
                 result["metrics"]["replies_published"] += 1
                 result["published"].append({"kind": "reply", "post_id": post_id})
 
-            state.mark_replied(comment_id)
+            if kind == "comment":
+                state.mark_replied(target_id)
+            else:
+                state.mark_replied_to_post(target_id)
+
+        # Clear the notification so the same item does not resurface every run.
+        if mode == "auto" and not dry_run:
+            try:
+                client.mark_read(post_id)
+            except MoltbookError:
+                pass
 
     if drafts:
         path = Path(config["drafts_path"])
@@ -388,6 +498,8 @@ def reply_lane(
             fh.write(f"\n# {stamp}\n\n" + "\n".join(drafts))
         result["metrics"]["replies_drafted"] = len(drafts)
         print(f"\n{len(drafts)} reply draft(s) written to {path}")
+        for draft in drafts:
+            print("\n" + draft)
 
 
 # --------------------------------------------------------------------------- #
@@ -425,7 +537,7 @@ def main(argv: list[str] | None = None) -> int:
             "comments_triaged": 0, "comments_flagged_hostile": 0,
             "guard_checks": 0, "guard_blocks": 0,
             "fleet_agents_read": 0, "fleet_agents_unreadable": 0,
-            "numeric_retries": 0,
+            "numeric_retries": 0, "title_retries": 0,
         },
         "published": [], "blocked": [], "errors": [],
     }

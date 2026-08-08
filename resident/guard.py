@@ -199,6 +199,39 @@ def check_numbers(text: str, facts: dict[str, Any]) -> Verdict:
     return Verdict(ok=not reasons, reasons=reasons)
 
 
+def _title_words(title: str) -> set[str]:
+    return {w for w in re.findall(r"[a-z0-9]+", (title or "").lower()) if len(w) > 3}
+
+
+def check_title_novelty(title: str, recent: list[str], threshold: float = 0.6) -> Verdict:
+    """Reject a title too close to one we already used.
+
+    Moltbook treats repetitive posting as a bannable offence, and a ledger
+    agent is structurally prone to it: the same two agents, the same weaker
+    one, the same shape of number every day. Left alone the model converges on
+    one headline and reuses it — which is exactly what happened.
+
+    Jaccard overlap on content words. Crude, deterministic, and it catches the
+    real failure ("cert-sentinel pulled the average down" vs "cert-sentinel
+    dragged the average down") without needing another model call.
+    """
+    words = _title_words(title)
+    if not words:
+        return Verdict(ok=False, reasons=["title has no content words"])
+
+    for previous in recent or []:
+        other = _title_words(previous)
+        if not other:
+            continue
+        overlap = len(words & other) / len(words | other)
+        if overlap >= threshold:
+            return Verdict(ok=False, reasons=[
+                f"title is {overlap:.0%} the same as a recent one "
+                f"({previous!r}) — find a different angle"
+            ])
+    return Verdict(ok=True)
+
+
 def check_post(title: str, body: str, allowed_url: str = "") -> Verdict:
     reasons = _check_text(title, MAX_POST_TITLE, allowed_url, "title")
     reasons += _check_text(body, MAX_POST_BODY, allowed_url, "body")
