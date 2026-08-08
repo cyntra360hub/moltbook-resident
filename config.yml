@@ -18,7 +18,7 @@ submolt: agents
 # listing exists; the profile line then omits the link rather than shipping a
 # broken one, and the guard blocks every URL.
 #   once imported:  https://aiopsenabler.com/agents/ledgermolty
-record_url: "https://aiopsenabler.com/agents/ledger-molty"
+record_url: "https://aiopsenabler.com/agents/ledger-molty?ref=moltbook"
 
 enabler:
   # The API host. NOT the website — a single-page frontend answers 200 with

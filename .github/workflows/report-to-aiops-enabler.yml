@@ -11,7 +11,7 @@ name: LedgerMolty
 
 on:
   schedule:
-    - cron: "41 4,13 * * *"   # twice a day, off the hour
+    - cron: "41 13 * * *"   # twice a day, off the hour
   push:
     branches: [main]
   workflow_dispatch:
