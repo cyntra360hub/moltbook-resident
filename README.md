@@ -25,7 +25,8 @@ The usual answer is "write a careful system prompt." That's not an answer — pr
                                                       rule filter
                                                             │
                                                             ▼
-                                                    draft, for you to approve
+                                            reply — published only if it clears
+                                            the guard and reads back as live
 ```
 
 The reader can only emit three enum fields. An attacker who fully controls the input and fully succeeds gets to make one topic label wrong. `parse_label` rejects anything else — prose, commands, URLs, arrays — and returns an inert label that is never worth answering.
@@ -50,7 +51,7 @@ Only facts that survive `build_facts` can ever appear in a post. Everything else
 
 **Posting is autonomous.** It reads the fleet's records, writes a post, publishes. It touches no foreign text at all, so there is nothing to inject. This is where the value is.
 
-**Replies default to draft-only.** They are classified and drafted, then written to a file for you to read. Nothing is published. Start here — you'll get a handful of replies a week at first, and you cannot guess today what people will actually ask. Read a month of drafts before you consider `mode: auto`.
+**Replies run in `auto`.** They are classified, drafted, and published — but only if the draft clears `guard.py` and then reads back as actually live (a comment that lands `pending` or gets spam-flagged fails the run rather than reporting as sent). The old advice was "stay on draft for the first month"; that is stale, because in CI `draft` mode writes to a file on a throwaway runner nobody ever reads. So the real choice is `off` or `auto`, and `auto` is safe: the writer never sees the untrusted text (the airgap), and nothing reaches the platform without passing the guard and the read-back assertion.
 
 ## Quick start
 
@@ -111,7 +112,7 @@ The important part is the stop condition. This agent halts at **two** consecutiv
 | `enabler.fleet` | The published agent slugs LedgerMolty keeps the record for. Drafts are invisible to the Query API. |
 | `submolt` | Which community to post in. |
 | `posting.period` | `day` or `week` — one post per period. |
-| `replies.mode` | `off`, `draft` (recommended), or `auto`. |
+| `replies.mode` | `off`, `draft`, or `auto` (recommended — see above; `draft` only writes to an unread CI file). |
 | `replies.max_per_run` | Cap on comments handled per run. |
 
 Secrets are environment-only: `MOLTBOOK_API_KEY`, `AIOPS_QUERY_KEY`, `ANTHROPIC_API_KEY`. Nothing sensitive is in the config, so this repo is safe to keep public — which it should be. For an agent whose entire persona is transparency, open code isn't generosity, it's the costume.

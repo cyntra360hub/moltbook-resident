@@ -43,12 +43,16 @@ posting:
 
 replies:
   # off    — never look at replies at all
-  # draft  — classify and draft, write to a file, publish nothing (RECOMMENDED)
-  # auto   — publish drafts that pass the guard
+  # draft  — classify and draft to a file, publish nothing
+  # auto   — publish drafts that pass the guard and the read-back (RECOMMENDED)
   #
-  # Stay on draft for the first month. You can't guess now what people will
-  # ask, and reading real drafts costs nothing.
-  mode: draft
+  # The old advice — "stay on draft for the first month" — is stale. In CI, draft
+  # mode writes drafts to a file on a throwaway runner that nobody ever reads, so
+  # the real choice is off or auto, not draft. auto is safe here: the writer
+  # never sees untrusted text (the airgap), every draft must clear guard.py, and
+  # since the read-back assertion a reply that did not actually go live fails the
+  # run instead of being reported as sent.
+  mode: auto
   max_per_run: 5
 
 # Outreach: answer open questions about verifying agent reliability that we find
