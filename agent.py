@@ -68,6 +68,13 @@ DEFAULTS: dict[str, Any] = {
     },
     "posting": {"enabled": True, "period": "day", "min_runs_to_post": 1},
     "replies": {"mode": "draft", "max_per_run": 5},
+    "outreach": {
+        "enabled": False,
+        "max_per_day": 1,
+        "max_age_hours": 48,
+        "max_existing_comments": 8,
+        "queries": [],
+    },
     "model": {"name": "claude-sonnet-4-6", "max_retries": 2},
     "state_path": "state/resident.json",
     "drafts_path": "state/drafts.md",
@@ -242,7 +249,19 @@ def post_lane(
     records = reader.read_fleet(fleet)
     result["metrics"]["fleet_agents_read"] = sum(1 for r in records if r.ok)
     result["metrics"]["fleet_agents_unreadable"] = sum(1 for r in records if not r.ok)
-    facts = material.build_facts(records, reader.platform)
+
+    # Day-over-day history. The leaderboard on its own is a single frozen
+    # snapshot, so without a stored prior run every post says the same thing.
+    # Diff against the most recent earlier snapshot, then record today's — but
+    # only if we actually read the directory, so a failed read cannot poison
+    # tomorrow's "who joined" count with an empty baseline.
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    snapshot = material.build_snapshot(reader.entries, reader.platform, today)
+    deltas = material.diff_snapshots(snapshot, state.snapshot_before(today), fleet)
+    if snapshot.get("agents"):
+        state.add_snapshot(snapshot)
+
+    facts = material.build_facts(records, reader.platform, deltas)
 
     if dry_run:
         print("\n--- what the Query API returned ---" + material.describe(records))
@@ -518,6 +537,240 @@ def reply_lane(
 
 
 # --------------------------------------------------------------------------- #
+# outreach lane
+# --------------------------------------------------------------------------- #
+
+
+def _parse_ts(value: Any) -> datetime | None:
+    """Parse an ISO-8601 timestamp, tolerating a trailing Z. Returns an aware
+    UTC datetime, or None if it cannot be read — which the caller treats as a
+    reason to skip. Fail closed: an unreadable age is not a young thread."""
+    text = str(value or "").strip()
+    if not text:
+        return None
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _comment_count(post: dict[str, Any]) -> int:
+    for key in ("comment_count", "comments_count", "num_comments", "reply_count"):
+        value = post.get(key)
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            return int(value)
+    comments = post.get("comments")
+    return len(comments) if isinstance(comments, list) else 0
+
+
+def outreach_skip_reason(
+    post: dict[str, Any],
+    my_id: str,
+    max_age_hours: float,
+    max_existing_comments: int,
+    replied_ids: set[str],
+    now: datetime,
+) -> str | None:
+    """Why this candidate should be skipped, or None if it survives every code
+    filter. Pure and deterministic: this runs BEFORE any model sees the post,
+    and every branch fails closed toward silence.
+    """
+    post_id = str(post.get("id", ""))
+    if not post_id:
+        return "no post id"
+    if my_id and str(post.get("author_id", "")) == my_id:
+        return "authored by us"
+    if post_id in replied_ids:
+        return "already replied to this post"
+
+    created = _parse_ts(post.get("created_at") or post.get("createdAt"))
+    if created is None:
+        return "no readable timestamp"
+    age_hours = (now - created).total_seconds() / 3600
+    if age_hours < 0:
+        return "timestamp is in the future"
+    if age_hours > max_age_hours:
+        return f"too old ({age_hours:.0f}h > {max_age_hours:.0f}h)"
+
+    comments = _comment_count(post)
+    if comments > max_existing_comments:
+        return f"thread too busy ({comments} > {max_existing_comments} comments)"
+
+    # The one place filter code reads the post text: a cheap substring check the
+    # spec calls for, not a model call.
+    text = f"{post.get('title', '')} {post.get('content', '')}"
+    if "?" not in text:
+        return "no question mark"
+
+    return None
+
+
+def _log_outreach(
+    result: dict[str, Any],
+    post_id: str,
+    label: Any,
+    reason: str,
+    draft: str = "",
+) -> None:
+    """Log one outreach decision — attempted, skipped, or published — to stdout
+    so it lands in the Actions log and can be audited, and into result.json."""
+    entry: dict[str, Any] = {
+        "post_id": post_id,
+        "label": label.to_dict() if label is not None else None,
+        "reason": reason,
+    }
+    if draft:
+        entry["draft"] = draft
+    result["outreach_log"].append(entry)
+    label_str = json.dumps(entry["label"]) if entry["label"] is not None else "-"
+    print(f"[outreach] post={post_id or '-'} :: {reason} :: label={label_str}")
+    if draft:
+        print(f"[outreach]   draft: {draft}")
+
+
+def outreach_lane(
+    client: MoltbookClient,
+    model: Anthropic,
+    reader: material.FleetReader,
+    state: State,
+    config: dict[str, Any],
+    dry_run: bool,
+    result: dict[str, Any],
+) -> None:
+    """Find open questions about verifying agent reliability and answer them.
+
+    The highest-risk lane in the repo: it appears in threads nobody invited it
+    into. It is built to fail closed — every candidate passes a deterministic
+    code filter before any model runs, the classifier emits only booleans, and
+    silence is the default at every step. A missed opportunity costs nothing; an
+    unwanted reply costs the account.
+
+    In a dry run the whole pipeline runs for audit but nothing is published and
+    nothing is recorded, so the operator can see exactly what it WOULD do. Live,
+    a disabled feature does nothing at all.
+    """
+    outreach = config.get("outreach", {})
+    live = bool(outreach.get("enabled"))
+    if not live and not dry_run:
+        return  # disabled, and not a dry run — do nothing at all
+
+    queries = list(outreach.get("queries") or [])
+    if not queries:
+        return
+
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    now = datetime.now(timezone.utc)
+    cap = int(outreach.get("max_per_day", 1))
+    already = state.outreach_sent_on(today)
+    if already >= cap:
+        _log_outreach(result, "", None, f"daily cap already reached ({already}/{cap})")
+        return
+
+    # Collect candidates across every query, de-duplicated, in code.
+    candidates: dict[str, dict[str, Any]] = {}
+    for query in queries:
+        try:
+            posts = client.search(query)
+        except MoltbookError as exc:
+            log.warning("outreach search failed for %r: %s", query, exc)
+            result["errors"].append(f"outreach search failed ({query!r}): {exc}")
+            continue
+        for post in posts:
+            post_id = str(post.get("id", ""))
+            if post_id and post_id not in candidates:
+                candidates[post_id] = post
+    result["metrics"]["outreach_candidates"] = len(candidates)
+    if not candidates:
+        _log_outreach(result, "", None, "no candidates returned by search")
+        return
+
+    try:
+        me = client.me()
+        my_id = str((me.get("agent") or me).get("id", ""))
+    except MoltbookError:
+        my_id = ""
+
+    facts = material.build_facts(
+        reader.read_fleet(config["enabler"]["fleet"]), reader.platform
+    )
+    replied = set(state.data.get("outreach_replied_post_ids", []))
+
+    sent = 0
+    for post_id, post in candidates.items():
+        if already + sent >= cap:
+            _log_outreach(result, post_id, None,
+                          "not evaluated — daily cap reached this run")
+            continue
+
+        reason = outreach_skip_reason(
+            post, my_id, float(outreach.get("max_age_hours", 48)),
+            int(outreach.get("max_existing_comments", 8)), replied, now,
+        )
+        if reason is not None:
+            _log_outreach(result, post_id, None, reason)
+            continue
+
+        # THE AIRGAP: the post text goes to triage and nowhere else.
+        text = f"{post.get('title', '')}\n\n{post.get('content', '')}"
+        label = triage.triage_outreach(text, model)
+        result["metrics"]["outreach_triaged"] += 1
+        if label.hostile:
+            result["metrics"]["outreach_flagged_hostile"] += 1
+        if not label.clears_all_gates():
+            _log_outreach(result, post_id, label, "classifier did not clear all gates")
+            continue
+
+        draft = compose.compose_outreach_reply(label, facts, model)
+        if not draft:
+            _log_outreach(result, post_id, label, "composer produced nothing")
+            continue
+
+        verdict = guard.check_outreach_reply(draft)
+        numbers = guard.check_numbers(draft, facts)
+        result["metrics"]["guard_checks"] += 2
+        if not verdict.ok or not numbers.ok:
+            result["metrics"]["outreach_blocked"] += 1
+            result["blocked"].append({
+                "kind": "outreach",
+                "reasons": (verdict.reasons or []) + (numbers.reasons or []),
+            })
+            _log_outreach(
+                result, post_id, label,
+                "blocked by guard: " + "; ".join(verdict.reasons + numbers.reasons),
+                draft,
+            )
+            continue
+
+        # Clears every gate. Publish only when live AND not a dry run.
+        if live and not dry_run:
+            _, challenge = client.create_comment(post_id, draft, "")
+            if challenge and not client.solve(challenge, make_puzzle_solver(model)):
+                # Published then hidden by a failed puzzle is an invisible
+                # success, which rule 5 says must be reported as a failure.
+                result["metrics"]["outreach_verification_failures"] += 1
+                result["errors"].append(
+                    f"outreach reply to {post_id} failed its verification puzzle "
+                    "and is now hidden"
+                )
+                _log_outreach(result, post_id, label, "PUBLISHED BUT UNVERIFIED", draft)
+                continue
+            state.mark_outreached(post_id)
+            state.record_outreach(today)
+            result["metrics"]["outreach_published"] += 1
+            result["published"].append({"kind": "outreach", "post_id": post_id})
+            _log_outreach(result, post_id, label, "PUBLISHED", draft)
+        else:
+            result["metrics"]["outreach_would_reply"] += 1
+            _log_outreach(result, post_id, label, "WOULD REPLY (dry-run)", draft)
+        sent += 1
+
+
+# --------------------------------------------------------------------------- #
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -554,7 +807,12 @@ def main(argv: list[str] | None = None) -> int:
             "fleet_agents_read": 0, "fleet_agents_unreadable": 0,
             "numeric_retries": 0, "title_retries": 0,
             "verification_failures": 0,
+            "outreach_candidates": 0, "outreach_triaged": 0,
+            "outreach_flagged_hostile": 0, "outreach_blocked": 0,
+            "outreach_published": 0, "outreach_would_reply": 0,
+            "outreach_verification_failures": 0,
         },
+        "outreach_log": [],
         "published": [], "blocked": [], "errors": [],
     }
 
@@ -609,6 +867,9 @@ def main(argv: list[str] | None = None) -> int:
                 post_lane(client, model, reader, state, config, args.dry_run, result)
             if args.replies:
                 reply_lane(client, model, reader, state, config, args.dry_run, result)
+                # Outreach rides the same flag but is gated by config.outreach
+                # (disabled by default). In a dry run it audits without posting.
+                outreach_lane(client, model, reader, state, config, args.dry_run, result)
 
     except SuspensionRisk as exc:
         result["outcome"] = "failure"
@@ -629,14 +890,18 @@ def main(argv: list[str] | None = None) -> int:
         state.save()
 
     metrics = result["metrics"]
-    if metrics.get("verification_failures") or metrics.get("guard_blocks"):
-        # Composed but never made it out. Reporting this as a success is how a
-        # broken agent stays green for a week.
+    if (metrics.get("verification_failures") or metrics.get("guard_blocks")
+            or metrics.get("outreach_verification_failures")):
+        # Composed but never made it out, or published then hidden by a failed
+        # puzzle. Reporting either as a success is how a broken agent stays
+        # green for a week. Note: a normal outreach SKIP is not counted here —
+        # staying silent is the safe default, not a failure.
         result["outcome"] = "failure"
     result["summary"] = (
         f"{metrics['posts_published']} post(s) published, "
         f"{metrics['replies_drafted']} reply draft(s), "
         f"{metrics['comments_triaged']} comment(s) triaged, "
+        f"{metrics['outreach_published']} outreach reply(ies), "
         f"{metrics['guard_blocks']} blocked by guard"
         if result["outcome"] == "success"
         else (result["errors"][0] if result["errors"] else "run failed")

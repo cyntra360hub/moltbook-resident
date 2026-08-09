@@ -35,6 +35,9 @@ TRIVIAL_NUMBERS = {0.0, 1.0}
 MAX_POST_TITLE = 300
 MAX_POST_BODY = 3000
 MAX_COMMENT = 1200
+# Outreach replies are held shorter (the writer is told "under 80 words"); this
+# is the hard ceiling that catches a runaway generation.
+MAX_OUTREACH = 800
 
 URL_RE = re.compile(r"https?://[^\s<>\"')\]]+", re.IGNORECASE)
 
@@ -243,3 +246,20 @@ def check_comment(text: str, allowed_url: str = "") -> Verdict:
         ok=not (r := _check_text(text, MAX_COMMENT, allowed_url, "comment")),
         reasons=r,
     )
+
+
+def check_outreach_reply(text: str) -> Verdict:
+    """Stricter than check_comment: an outreach reply may carry NO URL at all,
+    not even our own record link.
+
+    Outreach replies land in strangers' threads, and a link dropped into
+    someone else's thread is exactly what turns a contribution into spam — the
+    profile already carries the link for anyone curious. This is enforced here,
+    in code, on purpose: a prompt instruction could be argued out of the model,
+    an `if` statement cannot. It is passed no `allowed_url`, so `_check_text`
+    rejects every URL, and the explicit check below states the reason plainly.
+    """
+    reasons = _check_text(text, MAX_OUTREACH, allowed_url="", label="outreach reply")
+    if URL_RE.search(text) and not any("URL" in r for r in reasons):
+        reasons.append("outreach reply contains a URL; outreach replies carry no link")
+    return Verdict(ok=not reasons, reasons=reasons)

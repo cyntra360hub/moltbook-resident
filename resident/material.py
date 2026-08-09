@@ -169,6 +169,9 @@ class FleetReader:
         self.timeout = timeout
         self.path_template = path_template
         self.platform: dict[str, Any] = {}
+        # The full leaderboard from the last read_fleet, retained so the caller
+        # can snapshot the whole directory for day-over-day diffs.
+        self.entries: list[dict[str, Any]] = []
         self._auth_style: str | None = None
 
     def _headers(self, style: str) -> dict[str, str]:
@@ -280,6 +283,7 @@ class FleetReader:
             return [self.read_agent(slug) for slug in slugs]
 
         self.platform = platform_context(entries, generated_at)
+        self.entries = entries
         by_slug = {str(e.get("slug", "")): e for e in entries}
         records: list[AgentRecord] = []
 
@@ -346,6 +350,114 @@ def platform_context(entries: list[dict[str, Any]], generated_at: str) -> dict[s
     }
 
 
+def build_snapshot(
+    entries: list[dict[str, Any]], platform: dict[str, Any] | None, date: str
+) -> dict[str, Any]:
+    """A dated, minimal copy of the whole leaderboard, kept in local state so
+    the next run can compute day-over-day change.
+
+    Stores EVERY listed agent by slug — strangers included — because counting
+    the newcomers needs the full set. Those names stay in local state and never
+    reach a published fact: only aggregate counts, and our own fleet by name,
+    ever leave `diff_snapshots`.
+    """
+    agents: dict[str, Any] = {}
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        slug = str(entry.get("slug", ""))
+        if not slug:
+            continue
+        agents[slug] = {
+            "tasks_handled": as_number(find_field(entry, FIELD_CANDIDATES["total_events"])),
+            "success_rate": as_rate(find_field(entry, FIELD_CANDIDATES["success_rate"])),
+            "score": as_number(find_field(entry, FIELD_CANDIDATES["score"])),
+            "verification_level": str(entry.get("verification_level", "")),
+        }
+    platform = platform or {}
+    return {
+        "date": date,
+        "agents": agents,
+        "platform": {
+            "listed": int(platform.get("listed", 0) or 0),
+            "instrumented": int(platform.get("instrumented", 0) or 0),
+            "self_reported": int(platform.get("self_reported", 0) or 0),
+            "with_ratings": int(platform.get("with_ratings", 0) or 0),
+        },
+    }
+
+
+def diff_snapshots(
+    current: dict[str, Any],
+    previous: dict[str, Any] | None,
+    fleet: list[str],
+) -> dict[str, Any]:
+    """Day-over-day facts: what changed between two leaderboard snapshots.
+
+    Returns an empty dict when there is no previous snapshot — a first run has
+    no baseline and must not invent one.
+
+    THE NAMING RULE. Other people's agents appear here only as aggregate counts,
+    never by name and never ranked. Named movement is emitted exclusively for
+    our own fleet (the slugs in `fleet`). Several directory listings are
+    someone's first project; an agent operated by the platform publicly ranking
+    strangers by failure would be indefensible. Every figure returned here goes
+    on to be numeric-checked by the guard, like any other fact.
+    """
+    if not previous:
+        return {}
+
+    facts: dict[str, Any] = {}
+    cur_agents = current.get("agents", {}) or {}
+    prev_agents = previous.get("agents", {}) or {}
+
+    # Runs completed since the last report — per fleet agent, and the fleet total.
+    fleet_runs = 0
+    for slug in fleet:
+        cur, prev = cur_agents.get(slug), prev_agents.get(slug)
+        if not isinstance(cur, dict) or not isinstance(prev, dict):
+            continue
+        cur_runs, prev_runs = cur.get("tasks_handled"), prev.get("tasks_handled")
+        if cur_runs is None or prev_runs is None:
+            continue
+        done = int(round(cur_runs - prev_runs))
+        if done > 0:
+            facts[f"runs completed by {slug} since the last report"] = done
+            fleet_runs += done
+    if fleet_runs > 0:
+        facts["runs completed across the fleet since the last report"] = fleet_runs
+
+    # Whether each fleet agent's success rate rose or fell, and by how much.
+    for slug in fleet:
+        cur, prev = cur_agents.get(slug), prev_agents.get(slug)
+        if not isinstance(cur, dict) or not isinstance(prev, dict):
+            continue
+        cur_rate, prev_rate = cur.get("success_rate"), prev.get("success_rate")
+        if cur_rate is None or prev_rate is None:
+            continue
+        change = cur_rate - prev_rate
+        if abs(change) < 0.01:
+            continue  # unchanged to two decimals — not worth stating
+        direction = "rose" if change > 0 else "fell"
+        facts[f"{slug} success rate {direction} since the last report"] = (
+            f"{abs(change):.2f} points"
+        )
+
+    # How many agents joined the directory — a COUNT, never names.
+    joined = sum(1 for slug in cur_agents if slug not in prev_agents)
+    if joined > 0:
+        facts["agents joined the directory since the last report"] = joined
+
+    # The first human rating anywhere on the directory is genuinely newsworthy:
+    # the platform-wide count has been zero, so the first is real news.
+    prev_rated = int((previous.get("platform") or {}).get("with_ratings", 0) or 0)
+    cur_rated = int((current.get("platform") or {}).get("with_ratings", 0) or 0)
+    if prev_rated == 0 and cur_rated > 0:
+        facts["agents on the directory now carrying a human rating"] = cur_rated
+
+    return facts
+
+
 def as_rate(value: Any) -> float | None:
     """Normalize a success rate to a percentage.
 
@@ -374,13 +486,18 @@ def as_number(value: Any) -> float | None:
 
 
 def build_facts(
-    records: list[AgentRecord], platform: dict[str, Any] | None = None
+    records: list[AgentRecord],
+    platform: dict[str, Any] | None = None,
+    deltas: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Flatten fleet records into the narrow dict the writer receives.
 
     Only facts that survive this function can ever appear in a post. Anything
     the API returns that isn't mapped here is invisible to the writer — which
     is the point: it cannot casually mention a field nobody vetted.
+
+    `deltas` is the optional day-over-day facts from `diff_snapshots`. They are
+    merged in here so they pass through the same guard as every other figure.
     """
     live = [r for r in records if r.ok]
     if not live:
@@ -452,6 +569,9 @@ def build_facts(
         facts["of those, how many report telemetry"] = platform["instrumented"]
         facts["of those, how many are self-reported only"] = platform["self_reported"]
         facts["of those, how many have any human rating"] = platform["with_ratings"]
+
+    if deltas:
+        facts.update(deltas)
 
     return facts
 

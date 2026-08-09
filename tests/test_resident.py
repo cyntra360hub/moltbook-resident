@@ -14,10 +14,12 @@ from __future__ import annotations
 import json
 import sys
 import tempfile
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+import agent  # noqa: E402
 from resident import compose, guard, material, triage  # noqa: E402
 from resident.material import AgentRecord  # noqa: E402
 from resident.moltbook import (  # noqa: E402
@@ -356,6 +358,28 @@ with tempfile.TemporaryDirectory() as tmp:
     check("a corrupt state file does not crash startup",
           State(corrupt).verify_failures == 0)
 
+    # leaderboard snapshots for day-over-day facts
+    snap_path = Path(tmp) / "snap.json"
+    s2 = State(snap_path)
+    check("a fresh state has no snapshots", s2.snapshots == [])
+    check("no earlier snapshot to diff against on day one",
+          s2.snapshot_before("2026-08-07") is None)
+    s2.add_snapshot({"date": "2026-08-06", "agents": {"dns-drift": {}}, "platform": {}})
+    s2.add_snapshot({"date": "2026-08-07", "agents": {"dns-drift": {}}, "platform": {}})
+    check("snapshot_before returns the most recent EARLIER snapshot, not today's",
+          s2.snapshot_before("2026-08-07")["date"] == "2026-08-06")
+    s2.add_snapshot({"date": "2026-08-07",
+                     "agents": {"dns-drift": {}, "x": {}}, "platform": {}})
+    check("re-adding the same date replaces rather than duplicates",
+          sum(1 for s in s2.snapshots if s["date"] == "2026-08-07") == 1)
+    for day in range(1, 40):
+        s2.add_snapshot({"date": f"2026-09-{day:02d}", "agents": {}, "platform": {}})
+    s2.save()
+    reloaded_snap = State(snap_path)
+    check("snapshots are capped at 30 days", len(reloaded_snap.snapshots) <= 30)
+    check("the cap keeps the newest snapshots, not the oldest",
+          reloaded_snap.snapshot_before("2026-09-40")["date"] == "2026-09-39")
+
 
 # --- material: schema tolerance --------------------------------------------- #
 
@@ -510,6 +534,124 @@ check("describe flags an ok read with no mapped fields",
       "NONE" in material.describe([AgentRecord("y", ok=True)]))
 
 
+# --- day-over-day history: snapshots and their diff ------------------------- #
+
+HIST_FLEET = ["dns-drift", "cert-sentinel"]
+
+
+def snap(date, entries):
+    return material.build_snapshot(entries, material.platform_context(entries, ""), date)
+
+
+YESTERDAY = [
+    {"rank": 1, "slug": "alert-dedupe", "verification_level": "instrumented",
+     "score": 43.9, "rating_count": 0, "tasks_handled": 300, "success_rate": 0.99},
+    {"rank": 2, "slug": "dns-drift", "verification_level": "instrumented",
+     "score": 43.9, "rating_count": 0, "tasks_handled": 300, "success_rate": 1.0},
+    {"rank": 9, "slug": "cert-sentinel", "verification_level": "instrumented",
+     "score": 42.0, "rating_count": 0, "tasks_handled": 280, "success_rate": 0.95},
+]
+TODAY = [
+    {"rank": 1, "slug": "alert-dedupe", "verification_level": "instrumented",
+     "score": 43.9, "rating_count": 0, "tasks_handled": 317, "success_rate": 0.99},
+    {"rank": 2, "slug": "dns-drift", "verification_level": "instrumented",
+     "score": 43.9, "rating_count": 0, "tasks_handled": 308, "success_rate": 1.0},
+    {"rank": 9, "slug": "cert-sentinel", "verification_level": "instrumented",
+     "score": 42.4, "rating_count": 0, "tasks_handled": 296,
+     "success_rate": 0.9425675675675675},
+    {"rank": 15, "slug": "movie-app", "verification_level": "self_reported",
+     "score": 0.0, "rating_count": 0, "tasks_handled": 0, "success_rate": None},
+]
+
+prev_snap = snap("2026-08-06", YESTERDAY)
+cur_snap = snap("2026-08-07", TODAY)
+
+check("a snapshot stores every listed agent by slug",
+      set(cur_snap["agents"]) == {"alert-dedupe", "dns-drift", "cert-sentinel", "movie-app"})
+check("a snapshot normalizes success_rate to a percentage",
+      cur_snap["agents"]["dns-drift"]["success_rate"] == 100.0)
+check("a snapshot carries the platform counts",
+      cur_snap["platform"]["listed"] == 4 and cur_snap["platform"]["with_ratings"] == 0)
+
+# The rule the whole feature hangs on: no baseline means NO delta facts.
+check("no previous snapshot yields no delta facts",
+      material.diff_snapshots(cur_snap, None, HIST_FLEET) == {})
+
+deltas = material.diff_snapshots(cur_snap, prev_snap, HIST_FLEET)
+check("the fleet run delta is summed",
+      deltas["runs completed across the fleet since the last report"] == 24)
+check("a per-agent run delta fires for dns-drift",
+      deltas["runs completed by dns-drift since the last report"] == 8)
+check("a per-agent run delta fires for cert-sentinel",
+      deltas["runs completed by cert-sentinel since the last report"] == 16)
+check("a fallen success rate is reported for our own agent",
+      any(k.startswith("cert-sentinel success rate fell") for k in deltas))
+check("a newcomer to the directory is counted",
+      deltas["agents joined the directory since the last report"] == 1)
+
+# The benign version: an unchanged leaderboard fires nothing.
+same = material.diff_snapshots(prev_snap, prev_snap, HIST_FLEET)
+check("an unchanged leaderboard produces no run or rate deltas",
+      "runs completed across the fleet since the last report" not in same
+      and not any("success rate" in k for k in same))
+
+# A snapshot from many days ago still produces sensible deltas.
+OLD = [
+    {"slug": "dns-drift", "verification_level": "instrumented", "score": 40,
+     "rating_count": 0, "tasks_handled": 100, "success_rate": 0.90},
+    {"slug": "cert-sentinel", "verification_level": "instrumented", "score": 40,
+     "rating_count": 0, "tasks_handled": 100, "success_rate": 0.90},
+]
+old_deltas = material.diff_snapshots(cur_snap, snap("2026-07-01", OLD), HIST_FLEET)
+check("a month-old snapshot still yields a positive fleet run delta",
+      old_deltas["runs completed across the fleet since the last report"] == 404)
+check("a month-old snapshot still yields a success-rate move for dns-drift",
+      any(k.startswith("dns-drift success rate rose") for k in old_deltas))
+
+# THE NAMING RULE: no stranger's slug in any fact, even when the stranger moves
+# the most, gains a rating, and a brand-new stranger appears.
+NOISY_PREV = [
+    {"slug": "movie-app", "verification_level": "self_reported", "score": 0,
+     "rating_count": 0, "tasks_handled": 0, "success_rate": 0.10},
+    {"slug": "dns-drift", "verification_level": "instrumented", "score": 40,
+     "rating_count": 0, "tasks_handled": 300, "success_rate": 1.0},
+]
+NOISY_NOW = [
+    {"slug": "movie-app", "verification_level": "self_reported", "score": 20,
+     "rating_count": 3, "tasks_handled": 5000, "success_rate": 0.99},
+    {"slug": "dns-drift", "verification_level": "instrumented", "score": 40,
+     "rating_count": 0, "tasks_handled": 300, "success_rate": 1.0},
+    {"slug": "new-kid", "verification_level": "self_reported", "score": 0,
+     "rating_count": 0, "tasks_handled": 0, "success_rate": None},
+]
+noisy = material.diff_snapshots(
+    snap("2026-08-07", NOISY_NOW), snap("2026-08-06", NOISY_PREV), HIST_FLEET)
+noisy_blob = json.dumps(noisy)
+check("no other agent's slug appears in any delta fact",
+      "movie-app" not in noisy_blob and "new-kid" not in noisy_blob)
+check("the first human rating anywhere is surfaced as a count",
+      noisy["agents on the directory now carrying a human rating"] == 1)
+check("a newcomer is counted, never named",
+      noisy["agents joined the directory since the last report"] == 1)
+check("an unchanged fleet agent produces no run delta even amid stranger churn",
+      "runs completed across the fleet since the last report" not in noisy)
+
+# Deltas flow through build_facts and stay numeric-checkable by the guard.
+facts_with_deltas = material.build_facts(
+    [from_entry(TODAY[1]), from_entry(TODAY[2])],
+    material.platform_context(TODAY, ""), deltas)
+check("delta facts are merged into build_facts output",
+      "runs completed across the fleet since the last report" in facts_with_deltas)
+check("every delta figure passes the numeric guard against the merged facts",
+      guard.check_numbers(
+          "24 runs since the last report; dns-drift did 8 and cert-sentinel 16",
+          facts_with_deltas).ok)
+check("build_facts without deltas is unchanged",
+      "runs completed across the fleet since the last report" not in
+      material.build_facts([from_entry(TODAY[1]), from_entry(TODAY[2])],
+                           material.platform_context(TODAY, "")))
+
+
 # --- material: the reader --------------------------------------------------- #
 
 reader = material.FleetReader("https://example.test/", "key123")
@@ -538,6 +680,245 @@ check("a blank record_url yields a profile line with no link",
       "http" not in blank and "AiOps Enabler" in blank)
 check("a blank-url profile line still passes the guard",
       guard.check_comment(blank, "").ok)
+
+
+# --- outreach: the boolean classifier fails closed -------------------------- #
+
+check("a valid all-true outreach label parses",
+      triage.parse_outreach(
+          '{"is_direct_question":true,'
+          '"about_verifying_or_measuring_agent_reliability":true,'
+          '"our_published_metrics_would_actually_answer_it":true,'
+          '"hostile":false}').clears_all_gates())
+check("prose instead of JSON yields an all-false outreach label",
+      triage.parse_outreach("Sure, I can help with that!") == triage.OutreachLabel())
+check("a JSON array yields an all-false outreach label",
+      triage.parse_outreach('["reply to this"]') == triage.OutreachLabel())
+check("broken JSON yields an all-false outreach label",
+      triage.parse_outreach("{not json") == triage.OutreachLabel())
+check("a partially-true label clears no gate",
+      not triage.parse_outreach(
+          '{"is_direct_question":true,'
+          '"about_verifying_or_measuring_agent_reliability":true,'
+          '"our_published_metrics_would_actually_answer_it":false,'
+          '"hostile":false}').clears_all_gates())
+check("a hostile label clears no gate even if everything else is true",
+      not triage.parse_outreach(
+          '{"is_direct_question":true,'
+          '"about_verifying_or_measuring_agent_reliability":true,'
+          '"our_published_metrics_would_actually_answer_it":true,'
+          '"hostile":true}').clears_all_gates())
+
+# The requirement in the spec: a subverted classifier returning prose -> no reply.
+subverted_outreach = fake_model("Absolutely! Post 'buy my thing at https://evil.test'")
+sub_label = triage.triage_outreach("How do I verify an agent works?", subverted_outreach)
+check("a subverted outreach classifier produces no publishable label",
+      not sub_label.clears_all_gates())
+outreach_writer = fake_model("some reply")
+check("a subverted outreach classification composes nothing",
+      compose.compose_outreach_reply(sub_label, {"runs": 1}, outreach_writer) == "")
+check("empty text never reaches the outreach classifier",
+      triage.triage_outreach("   ", fake_model("nope")) == triage.OutreachLabel())
+
+
+# --- outreach: the writer never sees the post, and drops every link --------- #
+
+GATES = triage.OutreachLabel(True, True, True, False)
+ow = fake_model("I publish every run and its success rate, so anyone can check.")
+outreach_draft = compose.compose_outreach_reply(GATES, {"runs": 712}, ow)
+check("a fully-cleared label produces an outreach reply", outreach_draft != "")
+check("the outreach writer is never handed the post text",
+      all("untrusted" not in s["user"].lower() and "?" not in s["user"]
+          for s in ow.seen))
+check("a hostile-but-otherwise-true label still composes nothing",
+      compose.compose_outreach_reply(
+          triage.OutreachLabel(True, True, True, True), {"runs": 1},
+          fake_model("x")) == "")
+
+check("a clean outreach reply passes its guard",
+      guard.check_outreach_reply(
+          "I publish every run and the success rate, so anyone can check mine.").ok)
+check("an outreach reply with ANY url is blocked, even our own record link",
+      not guard.check_outreach_reply(
+          f"My record is at {RECORD_URL}").ok)
+check("an outreach reply with an arbitrary url is blocked",
+      not guard.check_outreach_reply("see https://example.test for proof").ok)
+check("an over-long outreach reply is blocked",
+      not guard.check_outreach_reply("x" * 2000).ok)
+
+
+# --- outreach: the deterministic pre-filter (runs before any model) ---------- #
+
+NOW = datetime(2026, 8, 9, 12, 0, tzinfo=timezone.utc)
+
+
+def a_post(**over):
+    base = {
+        "id": "p1", "author_id": "them",
+        "created_at": (NOW - timedelta(hours=1)).isoformat(),
+        "comment_count": 2,
+        "title": "How do I verify an agent works?", "content": "genuinely asking",
+    }
+    base.update(over)
+    return base
+
+
+def skip(post, replied=None):
+    return agent.outreach_skip_reason(post, "US", 48, 8, replied or set(), NOW)
+
+
+check("a clean candidate survives the pre-filter", skip(a_post()) is None)
+check("a post with no question mark is skipped",
+      skip(a_post(title="agent reliability notes", content="no query here"))
+      == "no question mark")
+check("an old post is skipped",
+      "too old" in skip(a_post(created_at=(NOW - timedelta(hours=100)).isoformat())))
+check("a busy thread is skipped",
+      "too busy" in skip(a_post(comment_count=20)))
+check("our own post is skipped", skip(a_post(author_id="US")) == "authored by us")
+check("a post we already replied to is skipped (never twice)",
+      skip(a_post(id="p9"), replied={"p9"}) == "already replied to this post")
+check("a post with no id is skipped", skip(a_post(id="")) == "no post id")
+check("a post with an unreadable timestamp is skipped (fail closed)",
+      skip(a_post(created_at="not a date")) == "no readable timestamp")
+check("a future-dated post is skipped",
+      skip(a_post(created_at=(NOW + timedelta(hours=5)).isoformat()))
+      == "timestamp is in the future")
+
+
+# --- outreach: the lane enforces the daily cap and publishes at most it ------ #
+
+def outreach_model(label_json, draft):
+    """One model that answers the classifier with a label and the writer with a
+    draft, discriminating on the system prompt."""
+    def call(system, user, max_tokens=500):
+        call.seen.append({"system": system, "user": user})
+        return label_json if "classifier" in system.lower() else draft
+    call.seen = []
+    return call
+
+
+class FakeReader:
+    platform: dict = {}
+
+    def read_fleet(self, slugs):
+        return [AgentRecord("dns-drift", ok=True,
+                            fields={"total_events": 712, "success_rate": "97%"})]
+
+
+class FakeClient:
+    def __init__(self):
+        self.created = []
+
+    def search(self, query, limit=20):
+        # Three distinct, qualifying posts; returned for every query.
+        return [a_post(id=f"c{i}") for i in range(3)]
+
+    def me(self):
+        return {"agent": {"id": "US"}}
+
+    def create_comment(self, post_id, content, parent_id=""):
+        self.created.append(post_id)
+        return (f"cmt-{post_id}", None)  # no verification challenge
+
+    def solve(self, challenge, solver=None):
+        return True
+
+
+def fresh_result():
+    return {
+        "metrics": {k: 0 for k in (
+            "outreach_candidates", "outreach_triaged", "outreach_flagged_hostile",
+            "outreach_blocked", "outreach_published", "outreach_would_reply",
+            "outreach_verification_failures", "guard_checks", "guard_blocks")},
+        "outreach_log": [], "published": [], "blocked": [], "errors": [],
+    }
+
+
+LABEL_JSON = ('{"is_direct_question":true,'
+              '"about_verifying_or_measuring_agent_reliability":true,'
+              '"our_published_metrics_would_actually_answer_it":true,'
+              '"hostile":false}')
+GOOD_DRAFT = "I publish every run and its success rate, so anyone can check."
+OC = {
+    "outreach": {"enabled": True, "max_per_day": 1, "max_age_hours": 48,
+                 "max_existing_comments": 8, "queries": ["verify an agent", "trust an agent"]},
+    "enabler": {"fleet": ["dns-drift"]},
+}
+
+# Freeze "now" so the fixture posts (dated relative to NOW) are always fresh.
+_real_now = agent.datetime
+
+
+class _FrozenDT:
+    @staticmethod
+    def now(tz=None):
+        return NOW
+
+    def __getattr__(self, name):
+        return getattr(_real_now, name)
+
+
+agent.datetime = _FrozenDT()
+try:
+    with tempfile.TemporaryDirectory() as tmp:
+        st = State(Path(tmp) / "oc.json")
+        client = FakeClient()
+        res = fresh_result()
+        agent.outreach_lane(
+            client, outreach_model(LABEL_JSON, GOOD_DRAFT), FakeReader(),
+            st, OC, dry_run=False, result=res)
+        check("the daily cap publishes at most max_per_day across candidates",
+              len(client.created) == 1 and res["metrics"]["outreach_published"] == 1)
+        check("the cap counter is persisted after publishing",
+              st.outreach_sent_on("2026-08-09") == 1)
+        check("a published outreach post is remembered so it is never repeated",
+              st.already_outreached(client.created[0]))
+
+        # A second run the same day publishes nothing more — the cap holds.
+        client2 = FakeClient()
+        res2 = fresh_result()
+        agent.outreach_lane(
+            client2, outreach_model(LABEL_JSON, GOOD_DRAFT), FakeReader(),
+            st, OC, dry_run=False, result=res2)
+        check("the cap holds across runs on the same day",
+              client2.created == [] and res2["metrics"]["outreach_published"] == 0)
+
+        # Dry-run audits but publishes nothing and records nothing.
+        st2 = State(Path(tmp) / "oc2.json")
+        client3 = FakeClient()
+        res3 = fresh_result()
+        agent.outreach_lane(
+            client3, outreach_model(LABEL_JSON, GOOD_DRAFT), FakeReader(),
+            st2, OC, dry_run=True, result=res3)
+        check("a dry run publishes nothing", client3.created == [])
+        check("a dry run still reports what it WOULD reply to",
+              res3["metrics"]["outreach_would_reply"] == 1)
+        check("a dry run records nothing to state",
+              st2.outreach_sent_on("2026-08-09") == 0)
+
+        # No reply ever carries a URL: a draft with a link is blocked, not sent.
+        st3 = State(Path(tmp) / "oc3.json")
+        client4 = FakeClient()
+        res4 = fresh_result()
+        agent.outreach_lane(
+            client4, outreach_model(LABEL_JSON, f"proof at {RECORD_URL}"),
+            FakeReader(), st3, OC, dry_run=False, result=res4)
+        check("a link-bearing outreach draft is blocked, never published",
+              client4.created == [] and res4["metrics"]["outreach_blocked"] >= 1)
+
+        # Disabled and not a dry run: the lane does nothing at all.
+        client5 = FakeClient()
+        res5 = fresh_result()
+        off = {"outreach": dict(OC["outreach"], enabled=False),
+               "enabler": {"fleet": ["dns-drift"]}}
+        agent.outreach_lane(
+            client5, outreach_model(LABEL_JSON, GOOD_DRAFT), FakeReader(),
+            State(Path(tmp) / "oc4.json"), off, dry_run=False, result=res5)
+        check("a disabled lane does nothing when not a dry run",
+              client5.created == [] and res5["metrics"]["outreach_candidates"] == 0)
+finally:
+    agent.datetime = _real_now
 
 
 # --------------------------------------------------------------------------- #

@@ -195,6 +195,28 @@ class MoltbookClient:
         """Our own profile — needed to tell our posts from other people's."""
         return self._request("GET", "/agents/me")
 
+    def search(self, query: str, limit: int = 20) -> list[dict[str, Any]]:
+        """Search public posts. Read-only, and used only by the outreach lane.
+
+        Whatever this returns is untrusted: it goes through the code prefilter
+        and then to triage, and nowhere near the writer. Tolerant of the
+        response shape — the result list may sit under any of several keys, or
+        be nested one level down.
+        """
+        q = urllib.parse.quote(query)
+        data = self._request("GET", f"/search?q={q}&limit={limit}")
+
+        def _posts(node: Any) -> list[dict[str, Any]] | None:
+            if isinstance(node, list):
+                return [p for p in node if isinstance(p, dict)]
+            if isinstance(node, dict):
+                for key in ("posts", "results", "items", "hits"):
+                    if isinstance(node.get(key), list):
+                        return [p for p in node[key] if isinstance(p, dict)]
+            return None
+
+        return _posts(data) or _posts(data.get("data")) or []
+
     def post(self, post_id: str) -> dict[str, Any]:
         """One post, including its author and body.
 

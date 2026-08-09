@@ -27,6 +27,14 @@ class State:
             "replied_post_ids": [],
             "recent_titles": [],
             "last_post_at": "",
+            # One dated leaderboard snapshot per day, so the next run can report
+            # what changed rather than the same frozen numbers every time.
+            "leaderboard_snapshots": [],
+            # Outreach: posts we've already replied to (kept separate from the
+            # mention/comment reply set), and a per-day counter so the hard cap
+            # survives a restart. A counter that resets every run is no cap.
+            "outreach_replied_post_ids": [],
+            "outreach_sent": {},
         }
         if self.path.exists():
             try:
@@ -43,6 +51,21 @@ class State:
         self.data["replied_comment_ids"] = self.data["replied_comment_ids"][-500:]
         self.data["replied_post_ids"] = self.data["replied_post_ids"][-500:]
         self.data["recent_titles"] = self.data["recent_titles"][-10:]
+        # Keep at most 30 days of snapshots. Dates are ISO strings, so a plain
+        # sort is chronological; the newest 30 survive.
+        self.data["leaderboard_snapshots"] = sorted(
+            self.data.get("leaderboard_snapshots", []),
+            key=lambda snap: str(snap.get("date", "")),
+        )[-30:]
+        self.data["outreach_replied_post_ids"] = (
+            self.data["outreach_replied_post_ids"][-500:]
+        )
+        # Keep only the most recent 30 days of outreach counters.
+        sent = self.data.get("outreach_sent", {})
+        if len(sent) > 30:
+            self.data["outreach_sent"] = {
+                day: sent[day] for day in sorted(sent)[-30:]
+            }
         tmp = self.path.with_suffix(".tmp")
         tmp.write_text(json.dumps(self.data, indent=2) + "\n", encoding="utf-8")
         tmp.replace(self.path)
@@ -86,3 +109,53 @@ class State:
     @verify_failures.setter
     def verify_failures(self, value: int) -> None:
         self.data["consecutive_verify_failures"] = int(value)
+
+    @property
+    def snapshots(self) -> list[dict[str, Any]]:
+        return list(self.data.get("leaderboard_snapshots", []))
+
+    def add_snapshot(self, snapshot: dict[str, Any]) -> None:
+        """Record one dated leaderboard snapshot, one per date (a re-run the
+        same day replaces the earlier one). Kept locally only: a snapshot holds
+        every listed agent's slug so a COUNT of newcomers is possible, but those
+        names must never be published — see material.diff_snapshots.
+        """
+        date = str(snapshot.get("date", ""))
+        if not date:
+            return
+        kept = [s for s in self.data.get("leaderboard_snapshots", [])
+                if str(s.get("date", "")) != date]
+        kept.append(snapshot)
+        self.data["leaderboard_snapshots"] = kept
+
+    def snapshot_before(self, date: str) -> dict[str, Any] | None:
+        """The most recent snapshot strictly older than `date`, or None.
+
+        Same-date snapshots are skipped: diffing today against an earlier run
+        the same day would report no movement and hide the real day-over-day
+        change. No earlier snapshot means no baseline, and the caller must then
+        emit no delta facts rather than invent one.
+        """
+        earlier = [s for s in self.data.get("leaderboard_snapshots", [])
+                   if str(s.get("date", "")) < date]
+        if not earlier:
+            return None
+        return max(earlier, key=lambda snap: str(snap.get("date", "")))
+
+    # --- outreach --------------------------------------------------------- #
+
+    def already_outreached(self, post_id: str) -> bool:
+        return post_id in self.data["outreach_replied_post_ids"]
+
+    def mark_outreached(self, post_id: str) -> None:
+        if post_id and post_id not in self.data["outreach_replied_post_ids"]:
+            self.data["outreach_replied_post_ids"].append(post_id)
+
+    def outreach_sent_on(self, date: str) -> int:
+        return int(self.data.get("outreach_sent", {}).get(date, 0))
+
+    def record_outreach(self, date: str) -> None:
+        """Count one outreach reply against `date`'s daily cap. Persisted, so a
+        retried or restarted run cannot reset the count and exceed the cap."""
+        sent = self.data.setdefault("outreach_sent", {})
+        sent[date] = int(sent.get(date, 0)) + 1

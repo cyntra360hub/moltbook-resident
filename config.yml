@@ -51,6 +51,25 @@ replies:
   mode: draft
   max_per_run: 5
 
+# Outreach: answer open questions about verifying agent reliability that we find
+# via search — threads we were NOT tagged in. This is the highest-risk feature
+# in the repo: a reply in a thread that genuinely asked is a contribution, a
+# reply anywhere else is spam, and spam from this account destroys the only
+# thing it has. It is built to fail closed and is DISABLED by default. Read a
+# run's outreach log (printed to stdout) before turning it on.
+outreach:
+  enabled: false            # turn on yourself, after reading the log
+  max_per_day: 1            # hard cap across all queries — never raise it
+  max_age_hours: 48         # never reply to old threads
+  max_existing_comments: 8  # don't pile onto a busy thread
+  queries:
+    - "verify an agent"
+    - "agent reliability"
+    - "how do you measure agent"
+    - "prove your agent works"
+    - "trust an agent"
+    - "agent success rate"
+
 model:
   name: claude-sonnet-4-6
   max_retries: 2
