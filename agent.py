@@ -200,6 +200,90 @@ def make_reader(config: dict[str, Any]) -> material.FleetReader:
     )
 
 
+def _withdraw_post(
+    client: MoltbookClient, post_id: str, result: dict[str, Any]
+) -> None:
+    """Best-effort remove an orphan post. A failed delete is itself recorded."""
+    if not post_id:
+        return
+    try:
+        client.delete_post(post_id)
+        result["errors"].append(f"withdrew post {post_id}")
+    except MoltbookError as exc:
+        result["errors"].append(f"could not withdraw post {post_id}: {exc}")
+
+
+def _confirm_post_live(
+    client: MoltbookClient, post_id: str, submolt: str, result: dict[str, Any]
+) -> bool:
+    """Read the post back and prove it is live before we call it published.
+
+    Returns True ONLY when the platform shows verification_status == 'verified'
+    and the post is neither spam nor deleted. On anything else — pending, spam,
+    deleted, a missing id, or a read-back that itself errors — it withdraws the
+    post (best effort) and records a verification failure, which flips the run's
+    outcome to 'failure'. This is CLAUDE.md rule 5: "the API accepted it" and "it
+    actually worked" must never be allowed to differ silently. The 08-08 m/agents
+    post passed its /verify challenge, was reported published, and was invisible
+    the whole time — this is the check that would have caught it.
+    """
+    if not post_id:
+        result["metrics"]["verification_failures"] += 1
+        result["errors"].append(
+            f"create_post to m/{submolt} returned no post id — cannot confirm "
+            "the post is live; failing the run"
+        )
+        return False
+
+    try:
+        live = client.post_verification(post_id)
+    except MoltbookError as exc:
+        # A read-back that ITSELF fails is not permission to assume success —
+        # the entire point of this check is that we stopped trusting an
+        # unverified "accepted". No read, no confidence, no success.
+        result["metrics"]["verification_failures"] += 1
+        result["errors"].append(
+            f"could not read back post {post_id} in m/{submolt} to confirm it is "
+            f"live ({exc}) — failing the run rather than assuming it worked"
+        )
+        return False
+
+    status = live.get("status") or "missing"
+    if status == "verified" and not live.get("is_deleted") and not live.get("is_spam"):
+        return True
+
+    result["metrics"]["verification_failures"] += 1
+    result["errors"].append(
+        f"post {post_id} in m/{live.get('submolt') or submolt} is not live "
+        f"(verification_status={status}, is_spam={live.get('is_spam')}, "
+        f"is_deleted={live.get('is_deleted')}) — withdrawing and failing the run"
+    )
+    _withdraw_post(client, post_id, result)
+    return False
+
+
+def _comment_is_live(
+    client: MoltbookClient, post_id: str, comment_id: str
+) -> tuple[bool, str]:
+    """(live, detail) for a just-created comment. Raises MoltbookError if the
+    read-back itself fails, so the caller can fail the run rather than guess.
+
+    Comments expose verification_status via the thread listing, so the same
+    rule-5 check applies. There is no comment-delete endpoint, so a non-live
+    comment cannot be withdrawn — the caller says so rather than faking it.
+    """
+    if not comment_id:
+        return False, "create_comment returned no id"
+    info = client.comment_verification(post_id, comment_id)
+    if not info.get("found"):
+        return False, "comment not present on read-back"
+    status = info.get("status") or "missing"
+    live = (status == "verified"
+            and not info.get("is_deleted") and not info.get("is_spam"))
+    return live, (f"verification_status={status}, is_spam={info.get('is_spam')}, "
+                  f"is_deleted={info.get('is_deleted')}")
+
+
 def post_lane(
     client: MoltbookClient,
     model: Anthropic,
@@ -332,30 +416,34 @@ def post_lane(
         return
 
     post_id, challenge = client.create_post(config["submolt"], title, body)
-    if challenge:
-        if not client.solve(challenge, make_puzzle_solver(model)):
-            # An unverified post is hidden from every feed and profile, and the
-            # platform's own /agents/me/posts filters it out — so it is
-            # invisible to the duplicate check too. Leaving it there means an
-            # orphan nobody can read that we cannot see either. Remove it and
-            # fail the run loudly, rather than reporting a success that isn't.
-            result["metrics"]["verification_failures"] += 1
-            result["errors"].append(
-                "verification challenge failed — the post would have been "
-                "invisible, so it was withdrawn"
-            )
-            try:
-                if post_id:
-                    client.delete_post(post_id)
-                    result["errors"].append(f"withdrew unverified post {post_id}")
-            except MoltbookError as exc:
-                result["errors"].append(f"could not withdraw the orphan post: {exc}")
-            return
+    # Log the id unconditionally, BEFORE anything that can fail. The 08-08
+    # m/agents post was undiagnosable because its id was recorded nowhere — not
+    # in the log, not in the ledger, and it is invisible on the platform. Never
+    # again: whatever happens next, the id is in the run log.
+    log.info("created post %s in m/%s", post_id or "<none>", config["submolt"])
+
+    if challenge and not client.solve(challenge, make_puzzle_solver(model)):
+        # /verify rejected the answer outright. An unverified post is hidden from
+        # every feed and profile and from /agents/me/posts, so it is invisible to
+        # our own duplicate check too. Remove it and fail loudly.
+        result["metrics"]["verification_failures"] += 1
+        result["errors"].append(
+            "verification challenge failed — the post would have been invisible"
+        )
+        _withdraw_post(client, post_id, result)
+        return
+
+    # A solved challenge (or none at all) is NOT proof the post is live: create
+    # and /verify can both "succeed" while the post sits at pending or is flagged
+    # spam. Read it back and look before we ever call it published — rule 5.
+    if not _confirm_post_live(client, post_id, config["submolt"], result):
+        return
 
     state.mark_posted(period)
     state.remember_title(title)
     result["metrics"]["posts_published"] += 1
     result["published"].append({"kind": "post", "id": post_id, "title": title})
+    log.info("post %s confirmed live (verified) in m/%s", post_id, config["submolt"])
 
 
 def _handle(
@@ -503,11 +591,32 @@ def reply_lane(
 
             if mode == "auto" and not dry_run:
                 parent = target_id if kind == "comment" else ""
-                _, challenge = client.create_comment(post_id, draft, parent)
+                comment_id, challenge = client.create_comment(post_id, draft, parent)
+                log.info("created reply %s on post %s", comment_id or "<none>", post_id)
                 if challenge and not client.solve(
                     challenge, make_puzzle_solver(model)
                 ):
-                    result["errors"].append("reply verification failed")
+                    result["metrics"]["reply_verification_failures"] += 1
+                    result["errors"].append(f"reply verification failed on {post_id}")
+                    continue
+                # Same rule 5 as posts: a "sent" comment can still be pending or
+                # spam-flagged and therefore invisible. Read it back and look.
+                try:
+                    reply_live, detail = _comment_is_live(client, post_id, comment_id)
+                except MoltbookError as exc:
+                    result["metrics"]["reply_verification_failures"] += 1
+                    result["errors"].append(
+                        f"could not read back reply {comment_id} on {post_id} "
+                        f"({exc}) — failing the run rather than assuming it posted"
+                    )
+                    continue
+                if not reply_live:
+                    result["metrics"]["reply_verification_failures"] += 1
+                    result["errors"].append(
+                        f"reply {comment_id} on {post_id} is not live ({detail}); "
+                        "no comment-withdraw endpoint exists, so it is left in "
+                        "place but the run fails rather than reporting success"
+                    )
                     continue
                 result["metrics"]["replies_published"] += 1
                 result["published"].append({"kind": "reply", "post_id": post_id})
@@ -748,7 +857,9 @@ def outreach_lane(
 
         # Clears every gate. Publish only when live AND not a dry run.
         if live and not dry_run:
-            _, challenge = client.create_comment(post_id, draft, "")
+            comment_id, challenge = client.create_comment(post_id, draft, "")
+            log.info("created outreach reply %s on post %s",
+                     comment_id or "<none>", post_id)
             if challenge and not client.solve(challenge, make_puzzle_solver(model)):
                 # Published then hidden by a failed puzzle is an invisible
                 # success, which rule 5 says must be reported as a failure.
@@ -756,6 +867,24 @@ def outreach_lane(
                 result["errors"].append(
                     f"outreach reply to {post_id} failed its verification puzzle "
                     "and is now hidden"
+                )
+                _log_outreach(result, post_id, label, "PUBLISHED BUT UNVERIFIED", draft)
+                continue
+            # A solved puzzle still is not proof: read the comment back and look.
+            try:
+                oc_live, detail = _comment_is_live(client, post_id, comment_id)
+            except MoltbookError as exc:
+                result["metrics"]["outreach_verification_failures"] += 1
+                result["errors"].append(
+                    f"could not read back outreach reply {comment_id} on {post_id} "
+                    f"({exc}) — failing the run rather than assuming it posted"
+                )
+                _log_outreach(result, post_id, label, "READ-BACK FAILED", draft)
+                continue
+            if not oc_live:
+                result["metrics"]["outreach_verification_failures"] += 1
+                result["errors"].append(
+                    f"outreach reply {comment_id} on {post_id} is not live ({detail})"
                 )
                 _log_outreach(result, post_id, label, "PUBLISHED BUT UNVERIFIED", draft)
                 continue
@@ -771,6 +900,53 @@ def outreach_lane(
 
 
 # --------------------------------------------------------------------------- #
+
+
+def _run_failed(metrics: dict[str, Any]) -> bool:
+    """Decide the run's outcome from its metrics.
+
+    A run is a failure if anything we tried to publish did not become live, or
+    the guard stopped a draft. Post, reply AND outreach verification failures all
+    count.
+
+    Note deliberately, so a future session does not "fix" it: a reply that never
+    became visible fails the ENTIRE run, which reports outcome=failure to AiOps
+    Enabler even when the post itself published fine. That over-reports failure —
+    and that is the honest side to err on. Rule 5 says an invisible success must
+    surface as a failure; over-reporting failure beats under-reporting it. Do NOT
+    downgrade a reply failure to a success-with-warning to make the run look
+    greener — that silently reopens the exact gap this change closed. A normal
+    outreach SKIP is not counted here; staying silent is the safe default.
+    """
+    return bool(
+        metrics.get("verification_failures")
+        or metrics.get("reply_verification_failures")
+        or metrics.get("outreach_verification_failures")
+        or metrics.get("guard_blocks")
+    )
+
+
+def _summary(outcome: str, metrics: dict[str, Any], errors: list[str]) -> str:
+    """One-line summary. On failure, name each verification counter separately so
+    the failure is attributable — a post that did not publish and a reply that
+    did not are different problems, and 'verification_failures: 1' alone hides
+    which one it was."""
+    if outcome == "success":
+        return (
+            f"{metrics['posts_published']} post(s) published, "
+            f"{metrics['replies_drafted']} reply draft(s), "
+            f"{metrics['comments_triaged']} comment(s) triaged, "
+            f"{metrics['outreach_published']} outreach reply(ies), "
+            f"{metrics['guard_blocks']} blocked by guard"
+        )
+    detail = errors[0] if errors else "run failed"
+    return (
+        f"{detail} "
+        f"[post_verification_failures={metrics.get('verification_failures', 0)}, "
+        f"reply_verification_failures={metrics.get('reply_verification_failures', 0)}, "
+        f"outreach_verification_failures="
+        f"{metrics.get('outreach_verification_failures', 0)}]"
+    )
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -806,7 +982,10 @@ def main(argv: list[str] | None = None) -> int:
             "guard_checks": 0, "guard_blocks": 0,
             "fleet_agents_read": 0, "fleet_agents_unreadable": 0,
             "numeric_retries": 0, "title_retries": 0,
+            # verification_failures counts POSTS that did not become live;
+            # replies have their own counter so a failure is attributable.
             "verification_failures": 0,
+            "reply_verification_failures": 0,
             "outreach_candidates": 0, "outreach_triaged": 0,
             "outreach_flagged_hostile": 0, "outreach_blocked": 0,
             "outreach_published": 0, "outreach_would_reply": 0,
@@ -890,22 +1069,9 @@ def main(argv: list[str] | None = None) -> int:
         state.save()
 
     metrics = result["metrics"]
-    if (metrics.get("verification_failures") or metrics.get("guard_blocks")
-            or metrics.get("outreach_verification_failures")):
-        # Composed but never made it out, or published then hidden by a failed
-        # puzzle. Reporting either as a success is how a broken agent stays
-        # green for a week. Note: a normal outreach SKIP is not counted here —
-        # staying silent is the safe default, not a failure.
+    if _run_failed(metrics):
         result["outcome"] = "failure"
-    result["summary"] = (
-        f"{metrics['posts_published']} post(s) published, "
-        f"{metrics['replies_drafted']} reply draft(s), "
-        f"{metrics['comments_triaged']} comment(s) triaged, "
-        f"{metrics['outreach_published']} outreach reply(ies), "
-        f"{metrics['guard_blocks']} blocked by guard"
-        if result["outcome"] == "success"
-        else (result["errors"][0] if result["errors"] else "run failed")
-    )
+    result["summary"] = _summary(result["outcome"], metrics, result["errors"])
 
     Path(config["out"]).write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")
     print("\n" + result["summary"])

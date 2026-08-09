@@ -264,6 +264,70 @@ class MoltbookClient:
     def delete_post(self, post_id: str) -> dict[str, Any]:
         return self._request("DELETE", f"/posts/{post_id}")
 
+    def post_verification(self, post_id: str) -> dict[str, Any]:
+        """Read a post back and report whether it is genuinely live.
+
+        "The API accepted it" and "it is visible" are different facts. A post can
+        return from create_post, come back `success: true` from /verify, and
+        STILL sit at verification_status 'pending' or be flagged 'spam' — each of
+        which is invisible in feeds, search AND /agents/me/posts, so it never
+        reaches our own duplicate check either. The only reliable test is to
+        fetch the post and look. See CLAUDE.md rule 5. Raises MoltbookError if
+        the read itself fails — the caller must treat that as a failure, not as
+        permission to assume success.
+        """
+        node = self.post(post_id)
+        if isinstance(node.get("post"), dict):
+            node = node["post"]
+        submolt = node.get("submolt")
+        if isinstance(submolt, dict):
+            submolt = submolt.get("name")
+        return {
+            "status": str(node.get("verification_status") or ""),
+            "is_deleted": bool(node.get("is_deleted")),
+            "is_spam": bool(node.get("is_spam")),
+            "submolt": submolt,
+        }
+
+    def comment_verification(self, post_id: str, comment_id: str) -> dict[str, Any]:
+        """Read a just-created comment back and report whether it is live.
+
+        There is no GET /comments/{id} — it 404s — but the thread listing at
+        GET /posts/{id}/comments returns our own comment with its
+        verification_status, so we look it up there and apply the same rule-5
+        check as posts. `found` is False when the comment is nowhere in the
+        thread, which is itself a sign it is not live. Note there is no
+        comment-delete endpoint, so an unverified comment cannot be withdrawn
+        the way a post can — the caller reports and fails rather than pretending.
+        """
+        data = self.comments(post_id, limit=50)
+
+        def find(node: Any) -> dict[str, Any] | None:
+            if isinstance(node, dict):
+                if str(node.get("id")) == str(comment_id) and \
+                        "verification_status" in node:
+                    return node
+                for value in node.values():
+                    hit = find(value)
+                    if hit is not None:
+                        return hit
+            elif isinstance(node, list):
+                for value in node:
+                    hit = find(value)
+                    if hit is not None:
+                        return hit
+            return None
+
+        match = find(data) if comment_id else None
+        if match is None:
+            return {"found": False, "status": "", "is_deleted": False, "is_spam": False}
+        return {
+            "found": True,
+            "status": str(match.get("verification_status") or ""),
+            "is_deleted": bool(match.get("is_deleted")),
+            "is_spam": bool(match.get("is_spam")),
+        }
+
     def mark_read(self, post_id: str) -> dict[str, Any]:
         return self._request("POST", f"/notifications/read-by-post/{post_id}")
 

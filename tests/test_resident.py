@@ -824,6 +824,11 @@ class FakeClient:
     def solve(self, challenge, solver=None):
         return True
 
+    def comment_verification(self, post_id, comment_id):
+        # The happy path: the read-back finds our comment, verified and live.
+        return {"found": True, "status": "verified",
+                "is_deleted": False, "is_spam": False}
+
 
 def fresh_result():
     return {
@@ -919,6 +924,173 @@ try:
               client5.created == [] and res5["metrics"]["outreach_candidates"] == 0)
 finally:
     agent.datetime = _real_now
+
+
+# --- post/comment read-back: "accepted" must never masquerade as "live" ----- #
+#
+# Rule 5. The 08-08 m/agents post passed its /verify challenge, was reported
+# published, and was invisible the entire time. These exercise the read-back
+# that closes that gap: a verified post is accepted; pending, spam, deleted, a
+# missing id, and a read-back that itself errors each withdraw (where possible)
+# and fail the run. The verified case is the negative test — the one that proves
+# the guard does not fire on a genuinely live post.
+
+class PostFake:
+    def __init__(self, status="verified", is_spam=False, is_deleted=False,
+                 raise_on_read=False, raise_on_delete=False):
+        self._status, self._spam, self._deleted = status, is_spam, is_deleted
+        self._raise_read, self._raise_delete = raise_on_read, raise_on_delete
+        self.deleted = []
+
+    def post_verification(self, post_id):
+        if self._raise_read:
+            raise MoltbookError("read-back HTTP 500")
+        return {"status": self._status, "is_spam": self._spam,
+                "is_deleted": self._deleted, "submolt": "agents"}
+
+    def delete_post(self, post_id):
+        if self._raise_delete:
+            raise MoltbookError("delete failed")
+        self.deleted.append(post_id)
+        return {}
+
+
+def rb_result():
+    return {"metrics": {"verification_failures": 0}, "errors": []}
+
+
+# Verified: live, nothing withdrawn, run not failed. (the negative test)
+r = rb_result()
+cli = PostFake(status="verified")
+check("a verified post read-back confirms live and withdraws nothing",
+      agent._confirm_post_live(cli, "p1", "agents", r) is True
+      and r["metrics"]["verification_failures"] == 0 and cli.deleted == [])
+
+# Pending: not live, withdrawn, run failed, message carries status + submolt.
+r = rb_result()
+cli = PostFake(status="pending")
+pending_live = agent._confirm_post_live(cli, "p2", "agents", r)
+check("a pending post is not live, is withdrawn, and fails the run",
+      pending_live is False and cli.deleted == ["p2"]
+      and r["metrics"]["verification_failures"] == 1)
+check("the pending failure names the status and the submolt",
+      any("pending" in e and "agents" in e for e in r["errors"]))
+
+# Spam: not live even though status says 'verified' — spam is invisible too.
+r = rb_result()
+cli = PostFake(status="verified", is_spam=True)
+check("a spam-flagged post is withdrawn and fails even when 'verified'",
+      agent._confirm_post_live(cli, "p3", "agents", r) is False
+      and cli.deleted == ["p3"] and r["metrics"]["verification_failures"] == 1)
+
+# Deleted: not live, withdrawn, fails.
+r = rb_result()
+cli = PostFake(status="verified", is_deleted=True)
+check("a deleted post is not live and fails the run",
+      agent._confirm_post_live(cli, "p4", "agents", r) is False
+      and r["metrics"]["verification_failures"] == 1)
+
+# Missing id: fail, and do NOT issue a phantom withdraw for an empty id.
+r = rb_result()
+cli = PostFake()
+check("a missing post id fails the run without a phantom withdraw",
+      agent._confirm_post_live(cli, "", "agents", r) is False
+      and cli.deleted == [] and r["metrics"]["verification_failures"] == 1)
+
+# Read-back that itself errors: fail. Never assume success on a failed read.
+r = rb_result()
+cli = PostFake(raise_on_read=True)
+check("a read-back that itself errors fails the run, never assumes success",
+      agent._confirm_post_live(cli, "p5", "agents", r) is False
+      and r["metrics"]["verification_failures"] == 1)
+
+# Missing status field ('missing') is treated as not-live and withdrawn.
+r = rb_result()
+cli = PostFake(status="")
+check("an empty/missing verification status is not live and is withdrawn",
+      agent._confirm_post_live(cli, "p6", "agents", r) is False
+      and cli.deleted == ["p6"] and r["metrics"]["verification_failures"] == 1)
+
+
+# --- comment read-back: the equivalent status the API does expose ----------- #
+
+class CommentFake:
+    def __init__(self, found=True, status="verified", is_spam=False,
+                 is_deleted=False, raise_on_read=False):
+        self._found, self._status = found, status
+        self._spam, self._deleted, self._raise = is_spam, is_deleted, raise_on_read
+
+    def comment_verification(self, post_id, comment_id):
+        if self._raise:
+            raise MoltbookError("thread read HTTP 500")
+        if not self._found:
+            return {"found": False, "status": "",
+                    "is_deleted": False, "is_spam": False}
+        return {"found": True, "status": self._status,
+                "is_deleted": self._deleted, "is_spam": self._spam}
+
+
+check("a verified comment reads back live",
+      agent._comment_is_live(CommentFake(status="verified"), "post", "c1")[0] is True)
+check("a pending comment reads back not-live",
+      agent._comment_is_live(CommentFake(status="pending"), "post", "c2")[0] is False)
+check("a comment absent from the thread reads back not-live",
+      agent._comment_is_live(CommentFake(found=False), "post", "c3")[0] is False)
+check("a comment with no id is not-live without a read call",
+      agent._comment_is_live(CommentFake(), "post", "")[0] is False)
+_raised = False
+try:
+    agent._comment_is_live(CommentFake(raise_on_read=True), "post", "c4")
+except MoltbookError:
+    _raised = True
+check("a comment read-back that errors propagates so the caller can fail",
+      _raised)
+
+
+# --- outcome + summary: post vs reply failures must stay distinguishable ----- #
+#
+# The whole reason replies get their own counter: a reply that did not publish
+# and a post that did not are different problems, and the operator must be able
+# to tell them apart in the summary AiOps Enabler receives.
+
+def _metrics(**over):
+    base = {"verification_failures": 0, "reply_verification_failures": 0,
+            "outreach_verification_failures": 0, "guard_blocks": 0,
+            "posts_published": 0, "replies_drafted": 0, "comments_triaged": 0,
+            "outreach_published": 0}
+    base.update(over)
+    return base
+
+check("a post verification failure fails the run",
+      agent._run_failed(_metrics(verification_failures=1)) is True)
+check("a reply verification failure ALSO fails the whole run",
+      agent._run_failed(_metrics(reply_verification_failures=1)) is True)
+check("an outreach verification failure fails the run",
+      agent._run_failed(_metrics(outreach_verification_failures=1)) is True)
+check("a guard block fails the run",
+      agent._run_failed(_metrics(guard_blocks=1)) is True)
+check("a clean run does not fail",
+      agent._run_failed(_metrics()) is False)
+
+# A reply-only failure must read as a reply failure, with the post count at zero.
+reply_only = agent._summary(
+    "failure", _metrics(reply_verification_failures=1),
+    ["reply verification failed on post-x"])
+check("the summary attributes a reply-only failure to the reply counter",
+      "reply_verification_failures=1" in reply_only
+      and "post_verification_failures=0" in reply_only)
+
+# A post-only failure must read as a post failure, with the reply count at zero.
+post_only = agent._summary(
+    "failure", _metrics(verification_failures=1),
+    ["post p2 in m/agents is not live (verification_status=pending, ...)"])
+check("the summary attributes a post-only failure to the post counter",
+      "post_verification_failures=1" in post_only
+      and "reply_verification_failures=0" in post_only)
+
+check("a successful run summary carries the published counts, not the failures",
+      "post(s) published" in agent._summary(
+          "success", _metrics(posts_published=1), []))
 
 
 # --------------------------------------------------------------------------- #
