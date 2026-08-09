@@ -58,7 +58,7 @@ replies:
 # thing it has. It is built to fail closed and is DISABLED by default. Read a
 # run's outreach log (printed to stdout) before turning it on.
 outreach:
-  enabled: false            # turn on yourself, after reading the log
+  enabled: true            # turn on yourself, after reading the log
   max_per_day: 1            # hard cap across all queries — never raise it
   max_age_hours: 48         # never reply to old threads
   max_existing_comments: 8  # don't pile onto a busy thread
